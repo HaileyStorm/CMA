@@ -1,52 +1,65 @@
 import math
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import List, Tuple, Optional, Union, Dict, Any
+import tiktoken
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from typing import List, Tuple, Optional, Union, Dict, Any
-import tiktoken
-from dataclasses import dataclass
 import yaml
-from pathlib import Path
-import re
 
 
 # -----------------------------------------------------------------------------
 # Configuration
 
 @dataclass
+class LayerGroup:
+    """Represents a group of layers and their associated memory update layer."""
+    group_idx: int
+    layer_indices: List[int] = field(default_factory=list)
+    memory_update_layer_idx: Optional[int] = None
+    read_only_layer_indices: List[int] = field(default_factory=list)
+    local_only_layer_indices: List[int] = field(default_factory=list)
+    has_memory: bool = False  # True if memory_update_layer_idx is not None
+
+
+@dataclass
 class CMAConfig:
     """Configuration for CMA model"""
     # Chunking
-    chunk_size: int = 1024
+    chunk_size: int = 768
     semantic_chunking_gap_percentage: float = 25.0
     boundary_search_chars: List[int] = (256, 64, 32)
     boundary_types: Dict[str, List[str]] = None
     buffer_ratio: float = 0.1
 
     # Memory
-    max_memory_size: int = 4096
-    reverse_memory_size: int = 1024
+    max_memory_size: int = 3072
+    reverse_memory_size: int = 320
     initial_write_fraction: float = 0.6
     memory_growth_function: str = "linear"
-    memory_cap_length: int = 65536
+    memory_cap_length: int = 49152
+    share_initial_memory: bool = False
+    reset_memory_on_cycle: bool = True
 
     # Reverse pass
     reverse_max_chunks: int = 4
-    standard_reverse_decay_step: float = 0.2
-    standard_reverse_decay_rate: float = 0.5
+    lookahead_reverse_decay_step: float = 0.2
+    lookahead_reverse_decay_rate: float = 0.5
     persistent_reverse_decay_step: float = 0.05
     persistent_reverse_decay_rate: float = 0.1
-    persistent_reverse_update_freq_tokens: int = 128
-    persistent_reverse_update_freq_semantic: Optional[str] = "secondary"
+    persistent_reverse_update_freq_tokens: Optional[int] = None
+    persistent_reverse_update_freq_semantic: Optional[str] = None # e.g. "secondary"
 
     # Model architecture
     embed_dim: int = 768
-    n_heads: int = 12
-    n_layers: int = 12
-    head_dim: int = 64
+    n_heads: int = 6
+    n_layers: int = 12  # Note: This might become redundant if layer_structure defines all layers
+    head_dim: int = 128  # Typically embed_dim // n_heads
     layer_structure: Optional[List[Dict]] = None
-    skip_attention_layers: List[int] = (6,)
+    skip_attention_layers: List[int] = (6,)  # Note: Indices need careful handling with groups
 
     # Control tokens
     integration_method: str = "query_fusion"
@@ -63,7 +76,8 @@ class CMAConfig:
 
     # Future‐masking schedule: progress breakpoints and rates
     mask_future_schedule: Tuple[float, float] = (0.3, 0.7)
-    mask_future_rates: Tuple[float, float, float] = (0.3, 0.5, 0.8)
+    mask_future_rates: Tuple[float, float, float] = (0.333, 0.667, 1.0)
+    enable_mask_future_dropout: bool = True
 
     def __post_init__(self):
         if self.boundary_types is None:
@@ -72,16 +86,23 @@ class CMAConfig:
                 "secondary": ["sentence_end", "line_break"],
                 "tertiary": ["clause_end", "code_line_end"]
             }
+        # Default layer structure if none provided
         if self.layer_structure is None:
-            self.layer_structure = [
-                {"group": {
-                    "layers": ["memory_read", "local_only", "local_only", "memory_update"],
-                    "repeat": 3
-                }}
-            ]
+            # Example: Alternate local and memory update layers implicitly grouped
+            self.layer_structure = []
+            for i in range(self.n_layers):
+                if (i + 1) % 5 == 0:  # Make every 5th layer a memory update layer
+                    self.layer_structure.append({"type": "memory_update"})
+                else:
+                    self.layer_structure.append({"type": "local_only"})
+            print("Warning: No layer_structure provided. Using default alternating structure.")
+
+        self.validate()
 
     @classmethod
     def from_dict(cls, config_dict: Dict[str, Any]) -> 'CMAConfig':
+        # Handle potential nested dicts if loading from complex YAML/JSON
+        # For now, assume flat structure matching dataclass fields
         return cls(**config_dict)
 
     @classmethod
@@ -91,13 +112,22 @@ class CMAConfig:
         return cls.from_dict(config_dict)
 
     def validate(self):
+        # Basic validations (keep these)
         assert 0 < self.semantic_chunking_gap_percentage < 100
         assert len(self.boundary_search_chars) == 3
         assert self.max_memory_size > 0
         assert self.reverse_memory_size > 0
         assert 0 <= self.initial_write_fraction <= 1.0
         assert self.reverse_max_chunks > 0
+        assert self.embed_dim > 0
+        assert self.n_heads > 0
         assert self.embed_dim % self.n_heads == 0
+        assert self.head_dim == self.embed_dim // self.n_heads  # Ensure head_dim is consistent, disable if adding variable head sizes or such.
+        assert isinstance(self.enable_mask_future_dropout, bool)
+
+        # Layer structure validation is handled during model init parsing
+        # because it needs the parsed structure itself. We could add config-level
+        # checks here later if needed (e.g., check layer type strings are valid).
 
 
 # -----------------------------------------------------------------------------
@@ -176,7 +206,7 @@ class ControlTokenGenerator:
         # Memory mode flag
         if mode == "forward":
             memory_mode_flag = 0.0
-        elif mode == "standard_reverse":
+        elif mode == "lookahead_reverse":
             memory_mode_flag = 1.0
         elif mode == "persistent_reverse":
             memory_mode_flag = 0.8
@@ -194,7 +224,7 @@ class ControlTokenGenerator:
         # Chunk position ratio
         if mode == "forward":
             chunk_position_ratio = current_chunk_idx / total_chunks if total_chunks > 0 else 0.0
-        elif mode in ["standard_reverse", "persistent_reverse"]:
+        elif mode in ["lookahead_reverse", "persistent_reverse"]:
             if reverse_chunk_idx is not None and reverse_window_size is not None:
                 chunk_position_ratio = (reverse_window_size - reverse_chunk_idx) / reverse_window_size
             else:
@@ -241,6 +271,13 @@ class ChunkProcessor:
             # Initial estimate of start position
             est_start = max(0, end_pos - target_size)
 
+            # Don't bypass gap logic for short texts
+            # Only use this shortcut if the text is shorter than the gap-adjusted target
+            if end_pos <= target_size and end_pos == len(text):
+                chunk_tokens = self.tokenizer.encode(text)
+                chunks.insert(0, chunk_tokens)
+                break
+
             # Loop to find suitable boundary
             found_valid_chunk = False
             iteration = 0
@@ -258,12 +295,15 @@ class ChunkProcessor:
                 chunk_text = text[start_pos:end_pos]
                 chunk_tokens = self.tokenizer.encode(chunk_text)
 
-                if len(chunk_tokens) <= self.config.chunk_size:
+                # Check if chunk respects the size limit
+                max_allowed_size = target_size if end_pos == len(text) else self.config.chunk_size
+
+                if len(chunk_tokens) <= max_allowed_size:
                     found_valid_chunk = True
                     chunks.insert(0, chunk_tokens)
                 else:
                     # Estimate new start position to reduce chunk size
-                    excess_tokens = len(chunk_tokens) - self.config.chunk_size
+                    excess_tokens = len(chunk_tokens) - max_allowed_size
                     chars_per_token = len(chunk_text) / len(chunk_tokens)
                     est_start = start_pos + int(excess_tokens * chars_per_token * 1.1)  # 1.1 buffer
                     iteration += 1
@@ -272,12 +312,21 @@ class ChunkProcessor:
             if not found_valid_chunk:
                 chunk_text = text[est_start:end_pos]
                 chunk_tokens = self.tokenizer.encode(chunk_text)
-                # If still too large, truncate
-                if len(chunk_tokens) > self.config.chunk_size:
-                    chunk_tokens = chunk_tokens[:self.config.chunk_size]
+
+                # If still too large, truncate to respect the limit
+                max_allowed_size = target_size if end_pos == len(text) else self.config.chunk_size
+                if len(chunk_tokens) > max_allowed_size:
+                    chunk_tokens = chunk_tokens[:max_allowed_size]
+
                 chunks.insert(0, chunk_tokens)
                 # Adjust start_pos for next iteration
                 start_pos = est_start
+
+            # Ensure we make progress in the outer loop
+            if start_pos >= end_pos:
+                start_pos = end_pos - 1
+            if start_pos < 0:
+                start_pos = 0
 
             end_pos = start_pos
 
@@ -342,81 +391,87 @@ class ChunkProcessor:
 # Memory management
 
 class MemoryManager:
-    """Manages forward and reverse memory states"""
+    """Manages forward memory scaling and reverse memory decay weights"""
 
     def __init__(self, config: CMAConfig):
         self.config = config
 
-    def get_effective_size(self, seq_len: int) -> int:
-        """Get effective forward memory size based on sequence length"""
+    def get_effective_size(self, total_tokens_processed: int) -> int:
+        seq_len = total_tokens_processed
         if self.config.memory_growth_function == "linear":
-            fraction = min(1.0, seq_len / self.config.memory_cap_length)
+            cap_length = max(1, self.config.memory_cap_length)
+            fraction = min(1.0, seq_len / cap_length)
         elif self.config.memory_growth_function == "log":
-            if seq_len <= 1:
-                fraction = 0.0
+            if seq_len <= 1: fraction = 0.0
             else:
-                fraction = math.log(seq_len) / math.log(self.config.memory_cap_length)
+                cap_length = max(2, self.config.memory_cap_length)
+                fraction = math.log(seq_len) / math.log(cap_length)
                 fraction = min(1.0, max(0.0, fraction))
-        else:
-            raise ValueError(f"Unknown growth function: {self.config.memory_growth_function}")
-
-        return int(self.config.max_memory_size * fraction)
+        else: raise ValueError(f"Unknown growth function: {self.config.memory_growth_function}")
+        effective_size = max(0, round(self.config.max_memory_size * fraction))
+        return effective_size
 
     def get_write_mask(
             self,
-            current_chunk_idx: int,
-            total_chunks: int,
-            seq_len: int,
-            batch_size: int = 1
+            current_chunk_idx_in_pass: int,
+            total_chunks_in_pass: int,
+            total_tokens_processed_before_chunk: int,
+            batch_size: int = 1,
+            device: torch.device = torch.device('cpu')
     ) -> Tensor:
-        """Get write mask for memory update"""
-        # Sequence-based write cap
-        seq_write_cap = self.get_effective_size(seq_len)
-
-        # Progressive write access within the sequence-determined cap
-        if total_chunks > 0:
-            chunk_progress = (current_chunk_idx + 1) / total_chunks
+        seq_write_cap = self.get_effective_size(total_tokens_processed_before_chunk)
+        if total_chunks_in_pass > 0:
+            chunk_progress = (current_chunk_idx_in_pass + 1) / total_chunks_in_pass
             initial_fraction = self.config.initial_write_fraction
             write_fraction = initial_fraction + (1.0 - initial_fraction) * chunk_progress
-        else:
-            write_fraction = self.config.initial_write_fraction
-
-        writable_size = int(seq_write_cap * write_fraction)
-
-        # Create mask
-        mask = torch.zeros(batch_size, self.config.max_memory_size, dtype=torch.bool)
-        mask[:, :writable_size] = True
-
+        else: write_fraction = self.config.initial_write_fraction
+        target_writable_size = int(self.config.max_memory_size * write_fraction)
+        writable_size = min(seq_write_cap, target_writable_size)
+        writable_size = max(0, writable_size)
+        mask = torch.zeros(batch_size, self.config.max_memory_size, dtype=torch.bool, device=device)
+        if writable_size > 0: mask[:, :writable_size] = True
         return mask
 
-    def apply_downweighting(
+    def calculate_reverse_decay_weights(
             self,
-            memory: Tensor,
-            chunk_indices: List[int],
-            is_reverse: bool,
-            is_persistent: bool
+            reverse_chunk_index: int,  # 0 for newest chunk in window, 1 for next, ...
+            window_size: int,
+            is_persistent: bool,
+            memory_shape: Tuple,  # e.g., (B, M, D)
+            device: torch.device
     ) -> Tensor:
-        """Apply downweighting to reverse memory during update"""
-        if not is_reverse:
-            return memory
+        """Calculate decay weights for a specific chunk in a reverse pass window."""
+        if window_size <= 0 or reverse_chunk_index < 0 or reverse_chunk_index >= window_size:
+            # Return uniform weights if input is invalid or window is empty
+            return torch.ones(memory_shape, device=device)
 
         if is_persistent:
             decay_step = self.config.persistent_reverse_decay_step
             decay_rate = self.config.persistent_reverse_decay_rate
-        else:
-            decay_step = self.config.standard_reverse_decay_step
-            decay_rate = self.config.standard_reverse_decay_rate
+        else:  # Lookahead reverse
+            decay_step = self.config.lookahead_reverse_decay_step
+            decay_rate = self.config.lookahead_reverse_decay_rate
 
-        # Apply exponential decay based on chunk position
-        weights = torch.ones_like(memory)
+        # Calculate the decay exponent based on the relative position from the newest chunk
+        # reverse_chunk_index = 0 (newest) -> exponent = 0 -> decay = 1.0
+        # reverse_chunk_index = 1 (next oldest) -> exponent = decay_step
+        # reverse_chunk_index = 2 -> exponent = decay_step + decay_step * decay_rate
+        # reverse_chunk_index = k -> exponent = decay_step * (1 + rate + rate^2 ... + rate^(k-1))
+        # Using simpler exponential decay for now as per original spec structure: rate^(index * step)
+        # This means decay_step acts more like a scaling factor on the index.
+        # Let's refine this based on the spec description:
+        # "initial step-dow ... exponential decay rate for weighting chunks beyond the second"
+        # Index 0 (newest): weight 1.0
+        # Index 1 (second): weight decay_step (if step is < 1) or maybe 1.0 - decay_step? Let's assume rate^step
+        # Index 2 (third): weight rate^(step) * rate^(step) = rate^(2*step) ?
+        # Let's use a simple exponential decay: decay_factor = decay_rate ** (reverse_chunk_index * decay_step)
+        # Ensure rate and step are reasonable (e.g., rate <= 1)
+        decay_rate = min(1.0, max(0.0, decay_rate))
+        decay_factor = decay_rate ** (reverse_chunk_index * decay_step)
 
-        for i, chunk_idx in enumerate(chunk_indices):
-            decay_factor = decay_rate ** (i * decay_step)
-            start_idx = i * (self.config.reverse_memory_size // len(chunk_indices))
-            end_idx = (i + 1) * (self.config.reverse_memory_size // len(chunk_indices))
-            weights[:, start_idx:end_idx] *= decay_factor
-
-        return memory * weights
+        # Create weights tensor
+        weights = torch.full(memory_shape, decay_factor, device=device)
+        return weights
 
 
 # -----------------------------------------------------------------------------
@@ -509,7 +564,7 @@ class CascadeMemoryAttention(nn.Module):
             self.fwd_memory_v_proj = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
             self.fwd_memory_gate_proj = nn.Linear(2 * config.embed_dim, config.embed_dim, bias=False)
 
-            # Reverse memory update parameters (shared between standard and persistent)
+            # Reverse memory update parameters (shared between lookahead and persistent)
             self.rev_memory_q_proj = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
             self.rev_memory_k_proj = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
             self.rev_memory_v_proj = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
@@ -543,6 +598,10 @@ class CascadeMemoryAttention(nn.Module):
                 control_tokens["chunk_position_ratio"]
             ], device=x.device).unsqueeze(0).unsqueeze(0).expand(B, T, -1)
             q = q + self.control_proj(ctrl_vec)
+
+        # Handle empty sequence
+        if T == 0:
+            return x, None, None, None
 
         # -------- K / V projection (plus memory tokens) --------------------------
         k = self.k_proj(x)
@@ -641,6 +700,11 @@ class CascadeMemoryAttention(nn.Module):
         reg_loss : optional scalar
         """
         B, h, T, _ = q.shape
+
+        # Handle empty sequence
+        if T == 0:
+            return torch.zeros_like(q), None
+
         S_keys = v.size(-2)  # T + mem_len
         mem_len = S_keys - chunk_len
         if mem_len == 0:  # nothing to gate
@@ -734,16 +798,17 @@ class CascadeMemoryAttention(nn.Module):
 # Block definition
 
 class Block(nn.Module):
-    """Transformer block with either CMA or standard attention"""
+    """Transformer block with group-aware memory handling."""
 
     def __init__(self, config: CMAConfig, layer_idx: int, layer_type: str = "local_only"):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.layer_type = layer_type
+        # Layer type determines behavior w.r.t memory group
+        self.layer_type = layer_type  # "local_only", "memory_read", "memory_update", "skip"
 
-        # Create attention layer
-        if layer_idx in config.skip_attention_layers:
+        # Create attention layer based on type
+        if self.layer_type == "skip":
             self.attn = None
         elif layer_type in ["memory_read", "memory_update"]:
             is_update = (layer_type == "memory_update")
@@ -758,57 +823,115 @@ class Block(nn.Module):
             nn.Linear(4 * config.embed_dim, config.embed_dim, bias=False)
         )
 
-        # Skip connection weights
-        self.lambdas = nn.Parameter(torch.tensor([1.0, 0.0]))
-
     def forward(
             self,
             x: Tensor,
-            forward_memory: Optional[Tensor] = None,
-            reverse_memory: Optional[Tensor] = None,
-            x0: Optional[Tensor] = None,
+            # Pass the *dictionaries* of memory states
+            M_fwd_dict: Dict[int, Tensor],
+            M_rev_std_dict: Dict[int, Tensor],
+            M_rev_persist_dict: Dict[int, Tensor],
+            # Pass the group ID for this layer
+            group_id: int,
+            # Pass the current operational mode/pass name
+            mode: str,  # "forward", "lookahead_reverse", "persistent_reverse", "generate"
             control_tokens: Optional[Dict[str, float]] = None,
-            do_memory_update: bool = False,
-            write_mask: Optional[Tensor] = None,
-            decay_weights: Optional[Tensor] = None,
-            is_reverse_update: bool = False
-    ) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor], Optional[Tensor]]:
+            write_mask: Optional[Tensor] = None,  # Forward pass only
+            decay_weights: Optional[Tensor] = None  # Reverse passes only
+    ) -> Tuple[Tensor, Optional[Tuple[int, Tensor]], Optional[Tuple[int, Tensor]], Optional[Tensor]]:
+        """
+        Forward pass for a block, aware of its group and the current pass mode.
 
-        # Apply skip connection from input
-        if x0 is not None:
-            x = self.lambdas[0] * x + self.lambdas[1] * x0
+        Args:
+            x: Input tensor (B, T, D).
+            M_fwd_dict: Dictionary mapping group_id to forward memory tensor.
+            M_rev_std_dict: Dictionary mapping group_id to lookahead reverse memory tensor.
+            M_rev_persist_dict: Dictionary mapping group_id to persistent reverse memory tensor.
+            group_id: The index of the group this layer belongs to.
+            mode: The current processing mode/pass.
+            control_tokens: Control signals.
+            write_mask: Mask for forward memory updates.
+            decay_weights: Weights for reverse memory updates.
 
-        updated_forward_memory = None
-        updated_reverse_memory = None
+        Returns:
+            Tuple:
+                - output_tensor (Tensor): Result after block processing.
+                - updated_fwd (Optional[Tuple[int, Tensor]]): (group_id, updated_tensor) if fwd mem updated.
+                - updated_rev (Optional[Tuple[int, Tensor]]): (group_id, updated_tensor) if rev mem updated.
+                - gate_reg_loss (Optional[Tensor]): Regularization loss from gating.
+        """
+        updated_fwd_result = None
+        updated_rev_result = None
         gate_reg_loss = None
+        attn_output = torch.zeros_like(x)  # Default if attention is skipped
 
-        # Attention
+        # --- Determine Memory Inputs and Update Flags based on Group and Mode ---
+        fwd_mem_in: Optional[Tensor] = None
+        rev_mem_in: Optional[Tensor] = None
+        do_memory_update: bool = False
+        is_reverse_update: bool = False
+
+        # Only access memory if the layer is not local_only and not skip
+        if self.layer_type not in ["local_only", "skip"]:
+            # Fetch memory relevant to the current mode
+            if mode == "forward":
+                fwd_mem_in = M_fwd_dict.get(group_id)
+                rev_mem_in = M_rev_std_dict.get(group_id)  # Forward pass uses Lookahead Reverse
+                # Update forward memory only if this is the group's update layer
+                do_memory_update = (self.layer_type == "memory_update")
+                is_reverse_update = False
+            elif mode == "lookahead_reverse":
+                # No forward memory input in reverse passes
+                rev_mem_in = M_rev_std_dict.get(group_id)
+                do_memory_update = (self.layer_type == "memory_update")
+                is_reverse_update = True
+            elif mode == "persistent_reverse":
+                rev_mem_in = M_rev_persist_dict.get(group_id)
+                do_memory_update = (self.layer_type == "memory_update")
+                is_reverse_update = True
+            elif mode == "generate":
+                # Generation reads Fwd and Persistent Reverse, never updates
+                fwd_mem_in = M_fwd_dict.get(group_id)
+                rev_mem_in = M_rev_persist_dict.get(group_id)
+                do_memory_update = False
+                is_reverse_update = False
+            else:
+                raise ValueError(f"Unknown mode in Block.forward: {mode}")
+
+        # --- Attention + Residual ---
         if self.attn is not None:
             residual = x
-            x = norm(x)  # Always use RMSNorm
+            x_norm = norm(x)
 
             if isinstance(self.attn, CascadeMemoryAttention):
-                attn_out, updated_forward_memory, updated_reverse_memory, gate_reg_loss = self.attn(
-                    x,
-                    forward_memory=forward_memory,
-                    reverse_memory=reverse_memory,
+                # Pass the determined memory inputs and flags
+                attn_output, fwd_mem_out, rev_mem_out, gate_reg_loss = self.attn(
+                    x_norm,
+                    forward_memory=fwd_mem_in,
+                    reverse_memory=rev_mem_in,
                     control_tokens=control_tokens,
                     do_memory_update=do_memory_update,
-                    write_mask=write_mask,
-                    decay_weights=decay_weights,
+                    write_mask=write_mask if not is_reverse_update else None,  # Only pass write_mask for fwd update
+                    decay_weights=decay_weights if is_reverse_update else None,  # Only pass decay for rev update
                     is_reverse_update=is_reverse_update
                 )
-            else:
-                attn_out = self.attn(x)
+                # Package updated memory with group_id for return
+                if fwd_mem_out is not None: updated_fwd_result = (group_id, fwd_mem_out)
+                if rev_mem_out is not None: updated_rev_result = (group_id, rev_mem_out)
 
-            x = residual + attn_out
+            elif isinstance(self.attn, CausalSelfAttention):
+                # Local attention only operates on x_norm
+                attn_output = self.attn(x_norm)
 
-        # MLP
+            x = residual + attn_output
+        # If self.attn is None (skip layer), x remains unchanged
+
+        # --- MLP + Residual ---
         residual = x
-        x = norm(x)  # Always use RMSNorm
-        x = residual + self.mlp(x)
+        x_norm = norm(x)
+        mlp_output = self.mlp(x_norm)
+        x = residual + mlp_output
 
-        return x, updated_forward_memory, updated_reverse_memory, gate_reg_loss
+        return x, updated_fwd_result, updated_rev_result, gate_reg_loss
 
 
 # -----------------------------------------------------------------------------
@@ -830,69 +953,185 @@ class CMAModel(nn.Module):
 
         # Model components
         self.token_embedding = nn.Embedding(vocab_size, config.embed_dim)
-        # No positional embeddings - rely on intra-chunk causal masking + CMA memories
 
-        # Layer structure from configuration
+        # --- Layer and Group Parsing ---
         self.layers = nn.ModuleList()
-        layer_idx = 0
+        self.layer_groups: List[LayerGroup] = []
+        self.layer_idx_to_group_idx: Dict[int, int] = {}
+        layer_idx_counter = 0
+        group_idx_counter = 0
+        all_read_only_indices = []
+        update_layer_group_map: Dict[int, int] = {}
 
-        # Parse layer structure
         for group_spec in config.layer_structure:
             if "group" in group_spec:
                 group_config = group_spec["group"]
                 layer_types = group_config["layers"]
                 repeat = group_config.get("repeat", 1)
-
                 for _ in range(repeat):
+                    current_group = LayerGroup(group_idx=group_idx_counter)
+                    group_update_layers = []
+                    group_read_only_layers = []
+                    group_local_only_layers = []
                     for layer_type in layer_types:
-                        self.layers.append(Block(config, layer_idx, layer_type))
-                        layer_idx += 1
+                        if layer_idx_counter in config.skip_attention_layers:
+                            layer = Block(config, layer_idx_counter, layer_type="skip")
+                        else:
+                            layer = Block(config, layer_idx_counter, layer_type)
+                        self.layers.append(layer)
+                        current_group.layer_indices.append(layer_idx_counter)
+                        self.layer_idx_to_group_idx[layer_idx_counter] = group_idx_counter
+                        if layer_type == "memory_update":
+                            group_update_layers.append(layer_idx_counter)
+                            current_group.has_memory = True
+                        elif layer_type == "memory_read":
+                            group_read_only_layers.append(layer_idx_counter)
+                            all_read_only_indices.append(layer_idx_counter)
+                            current_group.has_memory = True
+                        elif layer_type == "local_only" or layer_type == "skip":
+                            group_local_only_layers.append(layer_idx_counter)
+                        layer_idx_counter += 1
+                    if len(group_update_layers) > 1: raise ValueError(f"Group {group_idx_counter}: >1 update layer")
+                    if group_read_only_layers and not group_update_layers: raise ValueError(
+                        f"Group {group_idx_counter}: read-only layers require an update layer")
+                    if group_update_layers:
+                        current_group.memory_update_layer_idx = group_update_layers[0]
+                        update_layer_group_map[group_update_layers[0]] = group_idx_counter
+                    current_group.read_only_layer_indices = group_read_only_layers
+                    current_group.local_only_layer_indices = group_local_only_layers
+                    self.layer_groups.append(current_group)
+                    group_idx_counter += 1
             else:
-                # Single layer specified
                 layer_type = group_spec.get("type", "local_only")
-                self.layers.append(Block(config, layer_idx, layer_type))
-                layer_idx += 1
+                if layer_idx_counter in config.skip_attention_layers:
+                    layer = Block(config, layer_idx_counter, layer_type="skip")
+                else:
+                    layer = Block(config, layer_idx_counter, layer_type)
+                self.layers.append(layer)
+                current_group = LayerGroup(group_idx=group_idx_counter)
+                current_group.layer_indices.append(layer_idx_counter)
+                self.layer_idx_to_group_idx[layer_idx_counter] = group_idx_counter
+                group_update_layers = []
+                group_read_only_layers = []
+                group_local_only_layers = []
+                if layer_type == "memory_update":
+                    current_group.memory_update_layer_idx = layer_idx_counter
+                    current_group.has_memory = True
+                    update_layer_group_map[layer_idx_counter] = group_idx_counter
+                    group_update_layers.append(layer_idx_counter)
+                elif layer_type == "memory_read":
+                    all_read_only_indices.append(layer_idx_counter)
+                    group_read_only_layers.append(layer_idx_counter)
+                    current_group.has_memory = True
+                elif layer_type == "local_only" or layer_type == "skip":
+                    group_local_only_layers.append(layer_idx_counter)
+                current_group.read_only_layer_indices = group_read_only_layers
+                current_group.local_only_layer_indices = group_local_only_layers
+                self.layer_groups.append(current_group)
+                group_idx_counter += 1
+                layer_idx_counter += 1
+
+        for read_only_idx in all_read_only_indices:
+            group_idx = self.layer_idx_to_group_idx.get(read_only_idx)
+            if group_idx is None: raise ValueError(f"Internal error: Read-only layer {read_only_idx} has no group.")
+            group = self.layer_groups[group_idx]
+            if group.memory_update_layer_idx is None: raise ValueError(
+                f"Config error: Read-only layer {read_only_idx} in group {group_idx} lacks update layer.")
+
+        self.num_layers = layer_idx_counter
+        self.num_groups = group_idx_counter
+        self.num_memory_groups = sum(1 for g in self.layer_groups if g.has_memory)
+        print(f"Parsed {self.num_layers} layers into {self.num_groups} groups ({self.num_memory_groups} with memory).")
+        # --- End Layer and Group Parsing ---
 
         self.lm_head = nn.Linear(config.embed_dim, vocab_size, bias=False)
 
-        # Initialize memory states -- learnable parameters
-        self.initial_forward_memory = nn.Parameter(
-            torch.randn(1, config.max_memory_size, config.embed_dim) * config.memory_init_scale
-        )
-        self.initial_backward_memory = nn.Parameter(
-            torch.randn(1, config.reverse_memory_size, config.embed_dim) * config.memory_init_scale
-        )
+        # --- Initialize Memory Parameters ---
+        self.group_id_to_memory_idx: Dict[int, int] = {}
+        memory_param_idx_counter = 0
+        if self.num_memory_groups > 0:
+            if config.share_initial_memory:
+                print("Using shared initial memory parameters.")
+                shared_fwd = nn.Parameter(
+                    torch.randn(1, config.max_memory_size, config.embed_dim) * config.memory_init_scale)
+                shared_rev_s = nn.Parameter(
+                    torch.randn(1, config.reverse_memory_size, config.embed_dim) * config.memory_init_scale)
+                shared_rev_p = nn.Parameter(
+                    torch.randn(1, config.reverse_memory_size, config.embed_dim) * config.memory_init_scale)
+                self.initial_fwd_params = nn.ParameterList([shared_fwd] * self.num_memory_groups)
+                self.initial_rev_s_params = nn.ParameterList([shared_rev_s] * self.num_memory_groups)
+                self.initial_rev_p_params = nn.ParameterList([shared_rev_p] * self.num_memory_groups)
+                for group in self.layer_groups:
+                    if group.has_memory: self.group_id_to_memory_idx[group.group_idx] = 0
+                memory_param_idx_counter = 1
+            else:
+                print("Using dedicated initial memory parameters per group.")
+                fwd_params, rev_s_params, rev_p_params = [], [], []
+                for group in self.layer_groups:
+                    if group.has_memory:
+                        self.group_id_to_memory_idx[group.group_idx] = memory_param_idx_counter
+                        fwd_params.append(nn.Parameter(
+                            torch.randn(1, config.max_memory_size, config.embed_dim) * config.memory_init_scale))
+                        rev_s_params.append(nn.Parameter(
+                            torch.randn(1, config.reverse_memory_size, config.embed_dim) * config.memory_init_scale))
+                        rev_p_params.append(nn.Parameter(
+                            torch.randn(1, config.reverse_memory_size, config.embed_dim) * config.memory_init_scale))
+                        memory_param_idx_counter += 1
+                self.initial_fwd_params = nn.ParameterList(fwd_params)
+                self.initial_rev_s_params = nn.ParameterList(rev_s_params)
+                self.initial_rev_p_params = nn.ParameterList(rev_p_params)
 
-        # State tracking
-        self.M_fwd = None
-        self.M_rev_persist = None
-        self.current_chunks = []
-        self.closed_chunks = []
+            # Ensure all parameters are on the correct device
+            device = self.token_embedding.weight.device
+            for param_list in [self.initial_fwd_params, self.initial_rev_s_params, self.initial_rev_p_params]:
+                for param in param_list:
+                    param.data = param.data.to(device)
+        else:
+            print("No memory groups found. Initial memory parameters will not be created.")
+            self.initial_fwd_params = nn.ParameterList()
+            self.initial_rev_s_params = nn.ParameterList()
+            self.initial_rev_p_params = nn.ParameterList()
+        print(f"Created {memory_param_idx_counter} sets of initial memory parameters.")
+        # --- End Initialize Memory Parameters ---
+
+        # --- State Tracking ---
+        # Runtime memory states are dictionaries keyed by group_idx
+        self.M_fwd: Dict[int, Tensor] = {}
+        self.M_rev_std: Dict[int, Tensor] = {}
+        self.M_rev_persist: Dict[int, Tensor] = {}
+
+        self.closed_chunks: List[List[int]] = []
         self.total_tokens_processed = 0
         self.tokens_since_persistent_update = 0
-        self.current_chunk_tokens = []
+        self.current_chunk_tokens: List[int] = []
         self.current_chunk_text: str = ""
         self.training_step = 0
-        self.total_training_steps = 10000  # Default, should be set by trainer
+        self.total_training_steps = 10000
 
         # Initialize weights
         self.apply(self._init_weights)
 
         # --- Parameter Count ---
-        # Calculate total trainable parameters (includes initial memories)
         total_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-
-        # Calculate parameters specifically for initial memories
-        initial_memory_params = self.initial_forward_memory.numel() + self.initial_backward_memory.numel()
-
-        # Calculate other parameters by subtraction
+        initial_memory_params = 0
+        if hasattr(self, 'initial_fwd_params'): initial_memory_params += sum(
+            p.numel() for p in self.initial_fwd_params if p.requires_grad)
+        if hasattr(self, 'initial_rev_s_params'): initial_memory_params += sum(
+            p.numel() for p in self.initial_rev_s_params if p.requires_grad)
+        if hasattr(self, 'initial_rev_p_params'): initial_memory_params += sum(
+            p.numel() for p in self.initial_rev_p_params if p.requires_grad)
+        if config.share_initial_memory and self.num_memory_groups > 1:
+            num_shared_sets = 3
+            params_per_set = initial_memory_params // (
+                        self.num_memory_groups * num_shared_sets) if self.num_memory_groups > 0 else 0
+            initial_memory_params = num_shared_sets * params_per_set
         other_params = total_params - initial_memory_params
-
         print(f"--- CMA Model Parameter Count ---")
-        print(f"Initial memory parameters: {initial_memory_params:,}")
+        print(
+            f"Initial memory parameters: {initial_memory_params:,} ({memory_param_idx_counter} sets, {'shared' if config.share_initial_memory else 'dedicated'})")
         print(f"Other trainable parameters: {other_params:,}")
         print(f"Total trainable parameters: {total_params:,}")
-        print(f"---------------------------------")
+        print(f"------------------------------------------")
         # --- End Parameter Count ---
 
     def _init_weights(self, module):
@@ -903,231 +1142,273 @@ class CMAModel(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+    def _initialize_memory_states(self, force_reset: bool = False):
+        """Initializes or resets runtime memory state dictionaries."""
+        dev = self.token_embedding.weight.device
+        for group in self.layer_groups:
+            if group.has_memory:
+                group_idx = group.group_idx
+                mem_idx = self.group_id_to_memory_idx[group_idx]
+
+                # Initialize if None or if force_reset is True
+                if force_reset or group_idx not in self.M_fwd:
+                    self.M_fwd[group_idx] = self.initial_fwd_params[mem_idx].clone().detach().to(dev)
+                # M_rev_std is always reset/recomputed in the cycle, initialize empty or reset
+                # We initialize it here mainly to ensure the key exists if accessed before cycle
+                self.M_rev_std[group_idx] = torch.zeros(  # Placeholder, will be overwritten
+                    1, self.config.reverse_memory_size, self.config.embed_dim, device=dev
+                )
+                if force_reset or group_idx not in self.M_rev_persist:
+                    self.M_rev_persist[group_idx] = self.initial_rev_p_params[mem_idx].clone().detach().to(dev)
+
     def forward(
             self,
             input_ids: Union[str, List[int], List[List[int]], torch.Tensor, None],
-            *, training_mode: bool = False
-    ) -> torch.Tensor:
+            *, training_mode: bool = False  # Use this parameter
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
-        CMA forward pass (clean spec-aligned implementation).
-
-        ─ Flush triggers ────────────────────────────────────────────────────────
-        • user text / flat-token input arrives while an open chunk already exists
-        • new input would make the open chunk exceed `chunk_size`
-        • caller supplies pre-chunked input         (always flush)
-        After deciding to flush we:
-            1. build FULL_SEQUENCE = closed_chunks + open_chunk + new_input
-            2. re-chunk FULL_SEQUENCE (semantic, fixed, or caller-exact)
-            3. call _trigger_memory_update_cycle() once per CLOSED chunk
-            4. leave the tail as the new open chunk
-        Returns logits for the open chunk; memories live on self.
+        CMA forward pass. Handles input processing, chunking, triggering update cycles,
+        processing the current chunk, and aggregating gate loss during training.
         """
+        print(f"DEBUG: Forward called with input_ids type={type(input_ids)}, training_mode={training_mode}", flush=True)
 
-        # ───────── state guards ────────────────────────────────────────────────
-        if not hasattr(self, "closed_chunks"):
-            self.closed_chunks: List[List[int]] = []  # history
-        if not hasattr(self, "current_chunk_tokens"):
-            self.current_chunk_tokens: List[int] = []  # open chunk
+        # --- Set training state based on parameter ---
+        self.training = training_mode  # Set the nn.Module training state
 
+        self._initialize_memory_states(force_reset=False)
         dev = self.token_embedding.weight.device
-        if self.M_fwd is None:
-            self.M_fwd = self.initial_forward_memory.clone().to(dev)
-        if self.M_rev_persist is None:
-            self.M_rev_persist = self.initial_backward_memory.clone().to(dev)
+        print(f"DEBUG: Device in forward: {dev}", flush=True)
 
-        # ───────── early-exit on “no new tokens” ───────────────────────────────
+        cycle_gate_loss: Optional[torch.Tensor] = None  # Initialize cycle loss
+        chunk_gate_loss: Optional[torch.Tensor] = None  # Initialize chunk loss
+
         if input_ids in (None, "", [], torch.tensor([], dtype=torch.long)):
-            return (
-                self._process_current_chunk(generation_mode=not training_mode)
-                if self.current_chunk_tokens
-                else torch.zeros(1, 0, self.vocab_size, device=dev)
-            )
+            if self.current_chunk_tokens:
+                logits, chunk_gate_loss = self._process_current_chunk(generation_mode=not self.training)
+            else:
+                logits = torch.zeros(1, 0, self.vocab_size, device=dev)
+        else:
+            new_tokens: List[int]
+            mode: str
+            if isinstance(input_ids, str):
+                new_tokens = self.tokenizer.encode(input_ids)
+                mode = "semantic"
+            elif isinstance(input_ids, list) and input_ids and isinstance(input_ids[0], list):
+                new_chunks = [list(c) for c in input_ids]
+                new_tokens = [t for c in new_chunks for t in c]
+                mode = "caller_exact"
+            else:
+                new_tokens = input_ids.tolist() if isinstance(input_ids, torch.Tensor) else list(input_ids)
+                mode = "fixed"
 
-        # ───────── normalise new input ─────────────────────────────────────────
-        if isinstance(input_ids, str):
-            new_raw_text = input_ids
-            new_tokens = self.tokenizer.encode(new_raw_text)  # encode once
-            mode = "semantic"
-        elif isinstance(input_ids, list) and input_ids and isinstance(input_ids[0], list):
-            new_chunks = [list(c) for c in input_ids]  # honour caller
-            new_tokens = [t for c in new_chunks for t in c]
-            mode = "caller_exact"
-        else:  # flat tokens
-            new_tokens = input_ids.tolist() if isinstance(input_ids, torch.Tensor) else list(input_ids)
-            mode = "fixed"
+            print(f"DEBUG: Mode={mode}, new_tokens length={len(new_tokens)}", flush=True)
 
-        # ───────── decide whether to FLUSH before appending ────────────────────
-        flush_now = (
-                mode == "caller_exact" or
-                (self.current_chunk_tokens and mode in {"semantic", "fixed"}) or
-                (len(self.current_chunk_tokens) + len(new_tokens) > self.config.chunk_size)
-        )
-
-        if flush_now:
-            # 1. full visible sequence
-            full_tokens = [t for c in self.closed_chunks for t in c] + \
-                          self.current_chunk_tokens + new_tokens
-
-            # 2. global re-chunk
-            if mode == "semantic":
-                full_text = self.tokenizer.decode(full_tokens)
-                chunk_texts = self.chunk_processor.semantic_chunk_reverse_with_gap(full_text)
-                chunks = [self.tokenizer.encode(txt) for txt in chunk_texts]
-            elif mode == "caller_exact":
-                chunks = new_chunks  # history immutable
-                # prepend history & open chunk as-is
+            trigger_update_cycle = False
+            full_tokens = []
+            chunks = []
+            if mode == "caller_exact":
+                trigger_update_cycle = True
+                full_tokens = [t for c in self.closed_chunks for t in c] + self.current_chunk_tokens + new_tokens
                 chunks = self.closed_chunks + (
-                    [self.current_chunk_tokens] if self.current_chunk_tokens else []) + chunks
-            else:  # fixed
-                chunks = self.chunk_processor.fixed_size_chunk_reverse_with_gap(full_tokens)
+                    [self.current_chunk_tokens] if self.current_chunk_tokens else []) + new_chunks
+            elif self.current_chunk_tokens and mode in {"semantic", "fixed"}:
+                # If there's existing content in the buffer and new input arrives,
+                # we need to re-chunk and run a cycle to incorporate it properly.
+                trigger_update_cycle = True
+                full_tokens = [t for c in self.closed_chunks for t in c] + self.current_chunk_tokens + new_tokens
+                # Clear current chunk buffer as it's now part of full_tokens
+                self.current_chunk_tokens = []
+                self.current_chunk_text = ""
+            elif len(self.current_chunk_tokens) + len(new_tokens) >= self.config.chunk_size:
+                # If adding new tokens fills or exceeds the chunk size, trigger cycle.
+                trigger_update_cycle = True
+                full_tokens = [t for c in self.closed_chunks for t in c] + self.current_chunk_tokens + new_tokens
+                # Clear current chunk buffer
+                self.current_chunk_tokens = []
+                self.current_chunk_text = ""
+            else:
+                # Append new tokens if no cycle is triggered
+                self.current_chunk_tokens.extend(new_tokens)
+                try:
+                    self.current_chunk_text += self.tokenizer.decode(new_tokens)
+                except Exception as e:
+                    print(f"Warning: Error decoding appended tokens: {e}", flush=True)
 
-            # 3. iterate over CLOSED chunks
-            self.closed_chunks = []  # rebuild from scratch
-            self.current_chunk_tokens = []
-            for chunk in chunks[:-1]:
-                self.current_chunk_tokens = chunk
-                self._trigger_memory_update_cycle()  # updates memories, clears buffer
-                self.closed_chunks.append(chunk)
+            if trigger_update_cycle:
+                if self.config.reset_memory_on_cycle:
+                    print("Resetting memory states for update cycle.", flush=True)
+                    self._initialize_memory_states(force_reset=True)
 
-            # 4. keep tail open
-            self.current_chunk_tokens = chunks[-1] if chunks else []
+                if mode != "caller_exact":
+                    if mode == "semantic":
+                        full_text = self.tokenizer.decode(full_tokens)
+                        chunks = self.chunk_processor.semantic_chunk_reverse_with_gap(full_text)
+                    else:  # fixed
+                        chunks = self.chunk_processor.fixed_size_chunk_reverse_with_gap(full_tokens)
 
-        # ───────── append remaining tokens (only if no flush) ──────────────────
-        if not flush_now:
-            for t in new_tokens:
-                self.current_chunk_tokens.append(t)
-                self.tokens_since_persistent_update += 1
+                if not chunks:
+                    print("Warning: Re-chunking resulted in zero chunks.", flush=True)
+                    self.closed_chunks = []
+                    self.current_chunk_tokens = []
+                    self.current_chunk_text = ""
+                else:
+                    print(f"Triggering memory update cycle with {len(chunks)} chunks.", flush=True)
+                    print(f"DEBUG: About to call _trigger_memory_update_cycle", flush=True)
+                    # --- Capture gate loss from the update cycle ---
+                    cycle_gate_loss = self._trigger_memory_update_cycle(chunks)
+                    print(f"DEBUG: Returned from _trigger_memory_update_cycle", flush=True)
+                    # After cycle, current_chunk_tokens is updated, update text buffer
+                    try:
+                        self.current_chunk_text = self.tokenizer.decode(self.current_chunk_tokens)
+                    except Exception as e:
+                        print(f"Warning: Error decoding buffer after cycle: {e}", flush=True)
+                        self.current_chunk_text = ""
 
-        # ───────── logits for open chunk ───────────────────────────────────────
-        logits = (
-            self._process_current_chunk(generation_mode=not training_mode)
-            if self.current_chunk_tokens
-            else torch.zeros(1, 0, self.vocab_size, device=dev)
-        )
-        return logits
+            # --- Process the final (potentially partial) chunk for logits ---
+            # This runs regardless of whether a cycle was triggered, processing whatever is in current_chunk_tokens
+            if self.current_chunk_tokens:
+                logits, chunk_gate_loss = self._process_current_chunk(generation_mode=not self.training)
+            else:
+                # If cycle happened and last chunk was empty, or no input initially
+                logits = torch.zeros(1, 0, self.vocab_size, device=dev)
 
-    def _process_current_chunk(self, generation_mode: bool = False) -> torch.Tensor:
+        # --- Aggregate Gate Loss (only in training mode with regularization enabled) ---
+        total_gate_loss: Optional[torch.Tensor] = None
+        if self.training and self.config.gate_regularization_type is not None:
+            if cycle_gate_loss is not None and chunk_gate_loss is not None:
+                total_gate_loss = cycle_gate_loss + chunk_gate_loss
+            elif cycle_gate_loss is not None:
+                total_gate_loss = cycle_gate_loss
+            elif chunk_gate_loss is not None:
+                total_gate_loss = chunk_gate_loss
+            # If both are None, total_gate_loss remains None
+
+        # --- Return logits and the final aggregated gate loss ---
+        return logits, total_gate_loss
+
+    def _process_current_chunk(self, generation_mode: bool = False) -> Tuple[
+        torch.Tensor, Optional[torch.Tensor]]:  # Updated return signature
         """
-        Process the **current partial (or full) chunk** that lives in
-        `self.current_chunk_tokens`.
-
-        Args
-        ----
-        generation_mode : bool
-            • False  → we are inside a forward-update pass (enables memory writes)
-            • True   → we are streaming / sampling (read-only memories)
-
-        Returns
-        -------
-        logits : (1, T_chunk, vocab_size) tensor
-        """
-        if not self.current_chunk_tokens:  # empty edge-case
-            return torch.zeros(1, 0, self.vocab_size, device=self.M_fwd.device)
-
-        # -------- basic bookkeeping ------------------------------------------------
-        chunk_idx = len(self.closed_chunks)   # 0-based index of *current* chunk
-        total_chunks = chunk_idx + 1  # preceding chunks + this one
-        chunk_tokens = torch.tensor(self.current_chunk_tokens,
-                                    device=self.M_fwd.device, dtype=torch.long)
-        T_chunk = chunk_tokens.size(0)
-
-        # -------- embeddings & control tokens --------------------------------------
-        x = self.token_embedding(chunk_tokens).unsqueeze(0)  # (1 , T , D)
-
-        ctrl = self.control_token_generator.generate_control_tokens(
-            mode="generate" if generation_mode else "forward",
-            current_chunk_idx=chunk_idx,
-            total_chunks=total_chunks,
-            current_mem_size=self.memory_manager.get_effective_size(self.total_tokens_processed),
-            max_mem_size=self.config.max_memory_size,
-            seq_len=self.total_tokens_processed
-        )
-
-        # -------- run through the layer stack --------------------------------------
-        f_mem = self.M_fwd
-        r_mem = self.M_rev_persist
-
-        for layer in self.layers:
-            if layer.layer_type == "memory_update" and not generation_mode:
-                wmask = self.memory_manager.get_write_mask(chunk_idx, total_chunks,
-                                                           self.total_tokens_processed)
-                x, up_f, up_r, _ = layer(
-                    x,
-                    forward_memory=f_mem,
-                    reverse_memory=r_mem,
-                    control_tokens=ctrl,
-                    do_memory_update=True,
-                    write_mask=wmask,
-                    is_reverse_update=False
-                )
-                if up_f is not None:
-                    self.M_fwd = f_mem = up_f
-                if up_r is not None:  # unlikely in current call
-                    self.M_rev_persist = r_mem = up_r
-            else:  # normal / read-only layer
-                x, _, _, _ = layer(
-                    x,
-                    forward_memory=f_mem if layer.layer_type != "local_only" else None,
-                    reverse_memory=r_mem if layer.layer_type != "local_only" else None,
-                    control_tokens=ctrl
-                )
-
-        # -------- projection, book-keeping, return ---------------------------------
-        x = norm(x)
-        logits = self.lm_head(x)  # (1 , T , V)
-
-        return logits
-
-    def _trigger_memory_update_cycle(self):
-        """
-        Processes the single, complete chunk currently in self.current_chunk_tokens,
-        updates memory states (M_fwd, M_rev_persist) based on this chunk and
-        the history in self.closed_chunks, adds the processed chunk to
-        self.closed_chunks, and clears self.current_chunk_tokens.
-
-        Assumes global re-chunking has already happened before this is called.
+        Processes the current chunk buffer for logits.
+        Returns logits and accumulated gate loss for this chunk.
         """
         if not self.current_chunk_tokens:
-            # Should not happen if called correctly, but good to check.
-            print("WARNING: _trigger_memory_update_cycle called with empty buffer.")
-            return
+            return torch.zeros(1, 0, self.vocab_size,
+                               device=self.token_embedding.weight.device), None  # No loss if no tokens
+        self._initialize_memory_states(force_reset=False)
+        dev = self.token_embedding.weight.device
 
-        # The chunk to process now
-        chunk_to_process_list = list(self.current_chunk_tokens)
-        chunk_to_process_tensor = torch.tensor(chunk_to_process_list, device=self.M_fwd.device, dtype=torch.long)
-        chunk_idx = len(self.closed_chunks) # Index of the chunk *being* processed
+        chunk_idx = len(self.closed_chunks)
+        total_chunks_in_history = chunk_idx + 1
+        chunk_tensor = torch.tensor(self.current_chunk_tokens, device=dev, dtype=torch.long).unsqueeze(0)  # (1, T)
+        B, T = chunk_tensor.shape
+        x = self.token_embedding(chunk_tensor)  # (1, T, D)
 
-        # --- Step 1: Compute Standard Reverse Memory ---
-        # Includes history (closed_chunks) + the chunk being processed now
-        chunks_for_std_rev = self.closed_chunks + [chunk_to_process_list]
-        M_rev_std = self._compute_standard_reverse_memory(chunks_for_std_rev)
-
-        # --- Step 2: Forward Pass over the *single* current chunk ---
-        # This updates self.M_fwd based on chunk_to_process and M_rev_std
-        # We need a function like _process_chunk_in_cycle, let's assume it exists
-        # and correctly updates self.M_fwd when do_memory_update=True in CMA layers.
-        # We also need to update self.total_tokens_processed here.
-        self._process_chunk_in_cycle(
-            chunk_tensor=chunk_to_process_tensor,
-            chunk_idx=chunk_idx, # Use the index relative to the full sequence after rechunk
-            M_rev_std=M_rev_std
-            # This function needs to internally use self.M_fwd and update it.
+        approx_processed_len = sum(len(c) for c in self.closed_chunks)
+        current_mem_size = self.memory_manager.get_effective_size(approx_processed_len)
+        # Determine mode for control tokens and layer processing
+        mode = "generate" if generation_mode else "forward"  # Or could be a specific training mode
+        ctrl = self.control_token_generator.generate_control_tokens(
+            mode=mode,
+            current_chunk_idx=chunk_idx, total_chunks=total_chunks_in_history,
+            current_mem_size=current_mem_size, max_mem_size=self.config.max_memory_size,
+            seq_len=approx_processed_len
         )
-        # _process_chunk_in_cycle should also update self.total_tokens_processed
 
-        # --- Step 3: Compute Persistent Reverse Memory ---
-        # Based *only* on the history *before* this chunk was processed
-        # Note: self.closed_chunks does NOT yet include chunk_to_process_list
-        self.M_rev_persist = self._compute_persistent_reverse_memory(
-            self.closed_chunks + [chunk_to_process_list],  # Pass history + current chunk
-            mask_future=self.training
-        )
-        self.tokens_since_persistent_update = 0  # Reset counter after update
+        # Use copies of state dicts to pass to layers if needed, or pass self.M_* directly
+        # Passing self.M_* directly is fine as Block.forward reads from them
+        M_fwd = self.M_fwd
+        M_rev_std = self.M_rev_std  # Not used in generation/forward processing chunk
+        M_rev_persist = self.M_rev_persist
+        aggregated_gate_loss: Optional[torch.Tensor] = None  # Initialize accumulator for this chunk
 
-        # --- Step 4: Update History and Clear Buffer ---
-        self.closed_chunks.append(chunk_to_process_list) # Add the processed chunk to history
-        self.current_chunk_tokens = [] # Clear the buffer
-        self.current_chunk_text = ""
+        # --- Layer processing loop (Accumulate gate loss) ---
+        for layer_idx, layer in enumerate(self.layers):
+            group_idx = self.layer_idx_to_group_idx[layer_idx]
+
+            x, updated_fwd, updated_rev, gate_loss = layer(  # Capture gate_loss
+                x,
+                M_fwd_dict=M_fwd, M_rev_std_dict=M_rev_std, M_rev_persist_dict=M_rev_persist,
+                group_id=group_idx, mode=mode, control_tokens=ctrl,
+                write_mask=None, decay_weights=None  # No updates expected here
+            )
+
+            # Accumulate gate loss if returned
+            if gate_loss is not None:
+                # Ensure loss is a scalar or sum appropriately if per-head/token
+                current_loss = gate_loss.mean() if gate_loss.numel() > 1 else gate_loss
+                if aggregated_gate_loss is None:
+                    aggregated_gate_loss = current_loss
+                else:
+                    aggregated_gate_loss += current_loss  # Simple sum across layers
+
+            # --- Handle state updates (should be None in this mode) ---
+            if updated_fwd is not None: print(
+                f"Warning: Fwd memory updated unexpectedly in mode '{mode}' for group {updated_fwd[0]}")
+            if updated_rev is not None: print(
+                f"Warning: Rev memory updated unexpectedly in mode '{mode}' for group {updated_rev[0]}")
+
+        x = norm(x)
+        logits = self.lm_head(x)
+
+        # Return logits and the accumulated gate loss for this chunk
+        return logits, aggregated_gate_loss
+
+    def _trigger_memory_update_cycle(self, chunks: List[List[int]]) -> Optional[torch.Tensor]:
+        """
+        Processes the full sequence of chunks through the 3-pass cycle.
+        Returns aggregated gate loss from the forward pass if applicable.
+        """
+        print(f"DEBUG: Starting _trigger_memory_update_cycle with {len(chunks)} chunks", flush=True)
+
+        if not chunks:
+            print("Warning: _trigger_memory_update_cycle called with empty chunks list.", flush=True)
+            return None
+
+        print(f"Running 3-pass update cycle on {len(chunks)} chunks...", flush=True)
+        dev = self.token_embedding.weight.device
+        print(f"DEBUG: Device is {dev}", flush=True)
+
+        B = 1
+        cycle_gate_loss: Optional[torch.Tensor] = None  # Initialize
+
+        print("  Starting Pass 1: Lookahead Reverse...", flush=True)
+        print(f"DEBUG: About to call _run_lookahead_reverse_pass with chunks={len(chunks)}, B={B}, dev={dev}", flush=True)
+
+        try:
+            M_rev_std_computed = self._run_lookahead_reverse_pass(chunks, B, dev)
+            print("DEBUG: Successfully completed _run_lookahead_reverse_pass", flush=True)
+        except Exception as e:
+            print(f"ERROR in _run_lookahead_reverse_pass: {type(e).__name__}: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            raise
+
+        print("  Finished Pass 1.", flush=True)
+
+        print("  Starting Pass 2: Forward...", flush=True)
+        # --- Capture the returned gate loss from the forward pass ---
+        cycle_gate_loss = self._run_forward_pass(chunks, M_rev_std_computed, B, dev)
+        print("  Finished Pass 2.", flush=True)
+
+        del M_rev_std_computed
+        self.M_rev_std = {}  # Clear the temporary lookahead reverse memory
+
+        print("  Starting Pass 3: Persistent Reverse...", flush=True)
+        self._run_persistent_reverse_pass(chunks, B, dev)
+        print("  Finished Pass 3.", flush=True)
+
+        # Update state after successful cycle
+        self.closed_chunks = chunks[:-1]
+        self.current_chunk_tokens = chunks[-1]
+        new_total_tokens = sum(len(c) for c in chunks)
+        print(
+            f"  Update cycle complete. Updating total_tokens_processed from {self.total_tokens_processed} to {new_total_tokens}", flush=True)
+        self.total_tokens_processed = new_total_tokens
+        self.tokens_since_persistent_update = 0
+
+        # --- Return the aggregated gate loss from the forward pass ---
+        return cycle_gate_loss
 
     def _process_chunk_in_cycle(
             self,
@@ -1143,28 +1424,28 @@ class CMAModel(nn.Module):
         """
         # Assuming B=1 for stateful processing
         if chunk_tensor.ndim == 1:
-            chunk_tensor = chunk_tensor.unsqueeze(0) # Add batch dim if needed by layers
+            chunk_tensor = chunk_tensor.unsqueeze(0)  # Add batch dim if needed by layers
 
         # Get total chunks estimate for control tokens (might need adjustment)
         # Total chunks = history + current one being processed + estimate of future?
         # Let's use history + current as the known sequence length for ratios.
         total_chunks_so_far = len(self.closed_chunks) + 1
 
-        x = self.token_embedding(chunk_tensor) # Shape (1, T, D)
+        x = self.token_embedding(chunk_tensor)  # Shape (1, T, D)
 
         # Generate control tokens for the forward pass processing this chunk
         ctrl = self.control_token_generator.generate_control_tokens(
-            mode="forward", # Processing a known chunk in the forward direction
+            mode="forward",  # Processing a known chunk in the forward direction
             current_chunk_idx=chunk_idx,
-            total_chunks=total_chunks_so_far, # Use current known total
+            total_chunks=total_chunks_so_far,  # Use current known total
             current_mem_size=self.memory_manager.get_effective_size(self.total_tokens_processed),
             max_mem_size=self.config.max_memory_size,
-            seq_len=self.total_tokens_processed # Tokens processed *before* this chunk
+            seq_len=self.total_tokens_processed  # Tokens processed *before* this chunk
         )
 
         # Use local copies of memory states to avoid modifying them incorrectly if layer forward pass fails
         f_mem = self.M_fwd
-        r_mem_std = M_rev_std # Use the passed standard reverse memory
+        r_mem_std = M_rev_std  # Use the passed lookahead reverse memory
 
         for layer in self.layers:
             if layer.layer_type == "memory_update":
@@ -1173,20 +1454,20 @@ class CMAModel(nn.Module):
                     chunk_idx, total_chunks_so_far, self.total_tokens_processed, batch_size=1
                 )
                 # Pass M_rev_std for reading, but only update M_fwd (is_reverse_update=False)
-                x, updated_fwd, _, _ = layer( # Expect only updated_fwd to be non-None
+                x, updated_fwd, _, _gate_loss = layer(  # Expect only updated_fwd to be non-None
                     x,
                     forward_memory=f_mem,
-                    reverse_memory=r_mem_std, # Read from standard reverse
+                    reverse_memory=r_mem_std,  # Read from lookahead reverse
                     control_tokens=ctrl,
-                    do_memory_update=True, # Enable memory update
+                    do_memory_update=True,  # Enable memory update
                     write_mask=wmask,
-                    is_reverse_update=False # IMPORTANT: We are updating FORWARD memory here
+                    is_reverse_update=False  # IMPORTANT: We are updating FORWARD memory here
                 )
                 if updated_fwd is not None:
-                    f_mem = updated_fwd # Update local copy for next layer
+                    f_mem = updated_fwd  # Update local copy for next layer
             else:
                 # Read-only or local-only layer
-                x, _, _, _ = layer(
+                x, _, _, _gate_loss = layer(
                     x,
                     forward_memory=f_mem if layer.layer_type != "local_only" else None,
                     reverse_memory=r_mem_std if layer.layer_type != "local_only" else None,
@@ -1199,320 +1480,404 @@ class CMAModel(nn.Module):
         # Update total tokens processed *after* successfully processing the chunk
         self.total_tokens_processed += chunk_tensor.size(1)
 
-    def _compute_standard_reverse_memory(
-            self,
-            chunks: List[List[int]]
-    ) -> torch.Tensor:
-        """
-        Compute the standard reverse memory (M_rev_std) over the given chunks list,
-        including the most recently completed chunk at the end.
+    def _run_lookahead_reverse_pass(self, all_chunks: List[List[int]], B: int, dev: torch.device) -> Dict[int, Tensor]:
+        try:
+            """ Runs the lookahead reverse pass. """
+            print(f"DEBUG: Entering _run_lookahead_reverse_pass", flush=True)
 
-        Parameters
-        ----------
-        chunks : List[List[int]]
-            Token-ID lists of each chunk, in chronological order.
+            n_chunks = len(all_chunks)
+            window_start_idx = max(0, n_chunks - self.config.reverse_max_chunks)
+            reverse_window_chunks = all_chunks[window_start_idx:]
+            window_size = len(reverse_window_chunks)
 
-        Returns
-        -------
-        M_rev_std : Tensor
-            The reverse memory state after processing up to the last chunk.
-        """
+            print(f"DEBUG: n_chunks={n_chunks}, window_size={window_size}", flush=True)
 
-        # Initialize from the learned backward-memory parameters
-        M_rev_std = self.initial_backward_memory.clone().to(self.M_fwd.device)
-        total_chunks = len(chunks)
+            # Check if we're dealing with large chunks
+            for i, chunk in enumerate(reverse_window_chunks):
+                print(f"DEBUG: Chunk {i} size: {len(chunk)}", flush=True)
+                if len(chunk) > 150:  # Suspiciously large chunk
+                    print(f"WARNING: Very large chunk detected: {len(chunk)} tokens", flush=True)
 
-        # Select window of most-recent chunks for reverse pass
-        rev_window = chunks[-self.config.reverse_max_chunks:]
-        window_start = total_chunks - len(rev_window)
+            # Initialize M_rev_std for this pass locally
+            current_M_rev_std: Dict[int, Tensor] = {}
+            for group in self.layer_groups:
+                if group.has_memory:
+                    group_idx = group.group_idx
+                    mem_idx = self.group_id_to_memory_idx[group_idx]
+                    print(f"DEBUG: Initializing memory for group {group_idx}", flush=True)
 
-        # Iterate in reverse (newest→oldest)
-        for rev_idx, chunk in enumerate(reversed(rev_window)):
-            # Global index of this chunk
-            global_idx = window_start + (len(rev_window) - 1 - rev_idx)
+                    param = self.initial_rev_s_params[mem_idx]
+                    print(f"DEBUG: Parameter shape: {param.shape}, device: {param.device}", flush=True)
 
-            # Token embedding + batch dim
-            chunk_tensor = torch.tensor(chunk, device=self.M_fwd.device)
-            x = self.token_embedding(chunk_tensor).unsqueeze(0)
+                    current_M_rev_std[group_idx] = param.clone().detach().to(dev).repeat(B, 1, 1)
+                    print(f"DEBUG: Initialized memory for group {group_idx}, shape: {current_M_rev_std[group_idx].shape}",
+                          flush=True)
+            for i, chunk_tokens in enumerate(reversed(reverse_window_chunks)):
+                if not chunk_tokens:
+                    print(f"DEBUG: Skipping empty chunk at index {i}", flush=True)
+                    continue
 
-            # Control tokens for this reverse step
-            ctrl = self.control_token_generator.generate_control_tokens(
-                mode="standard_reverse",
-                current_chunk_idx=global_idx,
-                total_chunks=total_chunks,
-                current_mem_size=self.memory_manager.get_effective_size(self.total_tokens_processed),
-                max_mem_size=self.config.max_memory_size,
-                seq_len=self.total_tokens_processed,
-                reverse_chunk_idx=rev_idx,
-                reverse_window_size=len(rev_window)
-            )
+                print(f"DEBUG: Processing chunk {i} with {len(chunk_tokens)} tokens", flush=True)
 
-            # Layer-by-layer processing
-            for layer in self.layers:
-                if layer.layer_type == "memory_update":
-                    # Downweighting curve for reverse update
-                    decay = self.memory_manager.apply_downweighting(
-                        torch.ones_like(M_rev_std),
-                        [global_idx],
-                        is_reverse=True,
-                        is_persistent=False
-                    )
-                    x, _, updated_rev, _ = layer(
+                chunk_tensor = torch.tensor(chunk_tokens, dtype=torch.long, device=dev).unsqueeze(0)
+                print(f"DEBUG: Created chunk tensor with shape {chunk_tensor.shape}", flush=True)
+
+                # Check if embedding lookup could be the issue
+                try:
+                    x = self.token_embedding(chunk_tensor)
+                    print(f"DEBUG: Embedded chunk shape: {x.shape}", flush=True)
+                except Exception as e:
+                    print(f"ERROR: Embedding lookup failed: {e}", flush=True)
+                    exit(3)
+                global_chunk_idx = window_start_idx + (window_size - 1 - i);
+                reverse_chunk_idx = i
+
+                approx_processed_len = self.total_tokens_processed
+                current_mem_size = self.memory_manager.get_effective_size(approx_processed_len)
+                ctrl = self.control_token_generator.generate_control_tokens(
+                    mode="lookahead_reverse", current_chunk_idx=global_chunk_idx, total_chunks=n_chunks,
+                    current_mem_size=current_mem_size, max_mem_size=self.config.max_memory_size,
+                    seq_len=approx_processed_len, reverse_chunk_idx=reverse_chunk_idx, reverse_window_size=window_size
+                )
+
+                # Pass state dictionaries to layers
+                M_fwd = self.M_fwd  # Pass empty or existing state (not used by layers in this mode)
+                M_rev_persist = self.M_rev_persist  # Pass existing state (not used by layers in this mode)
+
+                for layer_idx, layer in enumerate(self.layers):
+                    group_idx = self.layer_idx_to_group_idx[layer_idx]
+                    group = self.layer_groups[group_idx]
+
+                    decay = None
+                    # Calculate decay only if it's an update layer for a group with memory
+                    if group.has_memory and layer_idx == group.memory_update_layer_idx:
+                        mem_shape = current_M_rev_std[group_idx].shape
+                        decay = self.memory_manager.calculate_reverse_decay_weights(
+                            reverse_chunk_index=reverse_chunk_idx, window_size=window_size,
+                            is_persistent=False, memory_shape=mem_shape, device=dev
+                        )
+
+                    x, _, updated_rev, _gate_loss = layer(  # Expect only updated_rev
                         x,
-                        reverse_memory=M_rev_std,
+                        M_fwd_dict=M_fwd,
+                        M_rev_std_dict=current_M_rev_std,  # Pass the dict being updated
+                        M_rev_persist_dict=M_rev_persist,
+                        group_id=group_idx,
+                        mode="lookahead_reverse",
                         control_tokens=ctrl,
-                        do_memory_update=True,
-                        decay_weights=decay,
-                        is_reverse_update=True
+                        write_mask=None,
+                        decay_weights=decay  # Pass calculated decay
                     )
+
+                    # Update the local state dict for the next layer
                     if updated_rev is not None:
-                        M_rev_std = updated_rev
-                else:
-                    x, _, _, _ = layer(
-                        x,
-                        reverse_memory=M_rev_std if layer.layer_type != "local_only" else None,
-                        control_tokens=ctrl
-                    )
-        return M_rev_std
+                        g_id, mem = updated_rev
+                        current_M_rev_std[g_id] = mem
+            return current_M_rev_std
 
-    def _compute_persistent_reverse_memory(
-            self,
-            chunks: List[List[int]],
-            *,
-            mask_future: bool = False
-    ) -> torch.Tensor:
-        """
-        Recompute the persistent reverse memory (M_rev_persist) over all chunks
-        *except* the most-recent (current) one.
+        except Exception as e:
+            print(f"Error in _run_lookahead_reverse_pass: {type(e).__name__}: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            raise
 
-        Parameters
-        ----------
-        chunks : List[List[int]]
-            Full list of chunks including the current one.
-        mask_future : bool
-            If True and model.training is True, apply future-dropout masking.
+    def _run_forward_pass(self, all_chunks: List[List[int]], M_rev_std_computed: Dict[int, Tensor], B: int,
+                          dev: torch.device) -> Optional[torch.Tensor]:
+        """ Runs the forward pass over all chunks, returning aggregated gate loss if applicable. """
+        n_chunks = len(all_chunks)
+        tokens_processed_before_cycle = self.total_tokens_processed
+        tokens_processed_in_pass = 0
 
-        Returns
-        -------
-        M_rev_persist : Tensor
-            The persistent reverse memory state.
-        """
+        M_fwd = self.M_fwd  # Will be updated in-place via layer returns
 
-        # Start from the learned backward-memory parameters
-        M_rev = self.initial_backward_memory.clone().to(self.M_fwd.device)
-        total_chunks = len(chunks)
+        # --- Handle Persistent Reverse Memory Masking (Training Only) ---
+        M_rev_persist_to_use: Dict[int, Tensor]
+        if self.training and self.config.enable_mask_future_dropout:
+            # Calculate dropout probability based on schedule
+            p_drop = get_mask_future_schedule(self.config, self.training_step, self.total_training_steps)
+            print(f"  Forward Pass (Training): Applying mask-future dropout with p={p_drop:.3f}")
+            # Create a masked copy for this pass
+            M_rev_persist_to_use = self._mask_persistent_memory(self.M_rev_persist, p_drop)
+        else:
+            # Use the original persistent memory during inference or if disabled
+            M_rev_persist_to_use = self.M_rev_persist
+        # --- End Masking ---
 
-        # Exclude the last chunk (current)
-        eligible = chunks[:-1]
-        if not eligible:
-            return M_rev
+        forward_gate_loss: Optional[torch.Tensor] = None
 
-        # Window of most-recent eligible chunks
-        rev_window = eligible[-self.config.reverse_max_chunks:]
-        start_idx = len(eligible) - len(rev_window)
+        for chunk_idx, chunk_tokens in enumerate(all_chunks):
+            chunk_tensor = torch.tensor(chunk_tokens, dtype=torch.long, device=dev).unsqueeze(0)
+            x = self.token_embedding(chunk_tensor)
 
-        # Optional future-dropout mask
-        if mask_future and self.training and rev_window:
-            p = get_mask_future_schedule(
-                self.config, self.training_step, self.total_training_steps
+            current_total_processed_before_chunk = tokens_processed_before_cycle + tokens_processed_in_pass
+
+            current_mem_size = self.memory_manager.get_effective_size(current_total_processed_before_chunk)
+            ctrl = self.control_token_generator.generate_control_tokens(
+                mode="forward", current_chunk_idx=chunk_idx, total_chunks=n_chunks,
+                current_mem_size=current_mem_size, max_mem_size=self.config.max_memory_size,
+                seq_len=current_total_processed_before_chunk
             )
-            keep = torch.rand(len(rev_window), device=M_rev.device) > p
-            rev_window = [c for c, k in zip(rev_window, keep) if k]
-            # adjust start_idx if some were dropped
-            # (simplest is to recompute start_idx = total_chunks - 1 - len(rev_window))
-            start_idx = total_chunks - 1 - len(rev_window)
 
-        # Process in reverse order
-        for rev_idx, chunk in enumerate(reversed(rev_window)):
-            global_idx = start_idx + (len(rev_window) - 1 - rev_idx)
-            chunk_tensor = torch.tensor(chunk, device=M_rev.device)
-            x = self.token_embedding(chunk_tensor).unsqueeze(0)
+            for layer_idx, layer in enumerate(self.layers):
+                group_idx = self.layer_idx_to_group_idx[layer_idx]
+                group = self.layer_groups[group_idx]
 
+                wmask = None
+                if group.has_memory and layer_idx == group.memory_update_layer_idx:
+                    wmask = self.memory_manager.get_write_mask(
+                        current_chunk_idx_in_pass=chunk_idx,
+                        total_chunks_in_pass=n_chunks,
+                        total_tokens_processed_before_chunk=current_total_processed_before_chunk,
+                        batch_size=B,
+                        device=dev
+                    )
+
+                # --- Pass the potentially masked persistent memory ---
+                x, updated_fwd, _, _gate_loss = layer(
+                    x,
+                    M_fwd_dict=M_fwd,
+                    M_rev_std_dict=M_rev_std_computed,  # Lookahead reverse (computed in Pass 1)
+                    M_rev_persist_dict=M_rev_persist_to_use,  # Persistent reverse (potentially masked)
+                    group_id=group_idx, mode="forward", control_tokens=ctrl,
+                    write_mask=wmask, decay_weights=None
+                )
+
+                if _gate_loss is not None:
+                    current_loss = _gate_loss.mean() if _gate_loss.numel() > 1 else _gate_loss
+                    if forward_gate_loss is None:
+                        forward_gate_loss = current_loss
+                    else:
+                        forward_gate_loss += current_loss
+
+                if updated_fwd is not None:
+                    g_id, mem = updated_fwd
+                    self.M_fwd[g_id] = mem
+
+            tokens_processed_in_pass += len(chunk_tokens)
+
+        return forward_gate_loss
+
+    def _run_persistent_reverse_pass(self, all_chunks: List[List[int]], B: int, dev: torch.device):
+        """ Runs the persistent reverse pass. """
+        n_chunks = len(all_chunks)
+        # Eligible chunks for persistent reverse are all except the last one
+        eligible_chunks = all_chunks[:-1]
+        if not eligible_chunks:
+            print("  Skipping Persistent Reverse Pass: No eligible preceding chunks.")
+            return  # Nothing to process
+
+        # Determine the window of chunks to process based on reverse_max_chunks
+        window_start_idx = max(0, len(eligible_chunks) - self.config.reverse_max_chunks)
+        reverse_window_chunks = eligible_chunks[window_start_idx:]
+        window_size = len(reverse_window_chunks)
+
+        if not reverse_window_chunks:
+            print("  Skipping Persistent Reverse Pass: Window is empty after eligibility check.")
+            return
+
+        # --- REMOVED MASK-FUTURE DROPOUT LOGIC FROM HERE ---
+        # The dropout is now applied when *reading* this memory in the forward pass during training.
+
+        # Pass state dictionaries (M_rev_persist will be updated directly)
+        M_fwd = self.M_fwd  # Not used by layers in this mode
+        M_rev_std = self.M_rev_std  # Not used by layers in this mode
+
+        # Initialize M_rev_persist for this pass if it doesn't exist (should exist after init/reset)
+        # Or reset it based on config? Let's reset it here to ensure clean state for the pass.
+        # This assumes the pass *recomputes* M_rev_persist from initial state + window.
+        # If M_rev_persist should accumulate across cycles (when reset_memory_on_cycle=False),
+        # this reset needs to be conditional. For now, assume reset per cycle pass.
+        current_M_rev_persist: Dict[int, Tensor] = {}
+        for group in self.layer_groups:
+            if group.has_memory:
+                group_idx = group.group_idx;
+                mem_idx = self.group_id_to_memory_idx[group_idx]
+                # Start from the learned initial state for this pass
+                current_M_rev_persist[group_idx] = self.initial_rev_p_params[mem_idx].clone().detach().to(
+                    dev).repeat(B, 1, 1)
+
+        for i, chunk_tokens in enumerate(reversed(reverse_window_chunks)):
+            chunk_tensor = torch.tensor(chunk_tokens, dtype=torch.long, device=dev).unsqueeze(0)
+            x = self.token_embedding(chunk_tensor)
+            # global_chunk_idx refers to index within eligible_chunks
+            global_chunk_idx_in_eligible = window_start_idx + (window_size - 1 - i)
+            # global_chunk_idx in all_chunks context is the same here as eligible are all but last
+            global_chunk_idx_in_all = global_chunk_idx_in_eligible
+            reverse_chunk_idx = i  # Index within the reversed window (0 = newest in window)
+
+            # Use total_tokens_processed which reflects state *before* this cycle started
+            approx_processed_len = self.total_tokens_processed
+            current_mem_size = self.memory_manager.get_effective_size(approx_processed_len)
             ctrl = self.control_token_generator.generate_control_tokens(
                 mode="persistent_reverse",
-                current_chunk_idx=global_idx,
-                total_chunks=total_chunks,
-                current_mem_size=self.memory_manager.get_effective_size(self.total_tokens_processed),
-                max_mem_size=self.config.max_memory_size,
-                seq_len=self.total_tokens_processed,
-                reverse_chunk_idx=rev_idx,
-                reverse_window_size=len(rev_window)
+                current_chunk_idx=global_chunk_idx_in_all,  # Use index relative to all chunks
+                total_chunks=n_chunks,  # Total chunks in the sequence
+                current_mem_size=current_mem_size, max_mem_size=self.config.max_memory_size,
+                seq_len=approx_processed_len,
+                reverse_chunk_idx=reverse_chunk_idx,  # Index within the processing window
+                reverse_window_size=window_size
             )
 
-            for layer in self.layers:
-                if layer.layer_type == "memory_update":
-                    decay = self.memory_manager.apply_downweighting(
-                        torch.ones_like(M_rev),
-                        [global_idx],
-                        is_reverse=True,
-                        is_persistent=True
-                    )
-                    x, _, updated_rev, _ = layer(
-                        x,
-                        reverse_memory=M_rev,
-                        control_tokens=ctrl,
-                        do_memory_update=True,
-                        decay_weights=decay,
-                        is_reverse_update=True
-                    )
-                    if updated_rev is not None:
-                        M_rev = updated_rev
-                else:
-                    x, _, _, _ = layer(
-                        x,
-                        reverse_memory=M_rev if layer.layer_type != "local_only" else None,
-                        control_tokens=ctrl
-                    )
-        return M_rev
+            for layer_idx, layer in enumerate(self.layers):
+                group_idx = self.layer_idx_to_group_idx[layer_idx]
+                group = self.layer_groups[group_idx]
+
+                decay = None
+                if group.has_memory and layer_idx == group.memory_update_layer_idx:
+                    # Ensure the group_idx exists in the dict before accessing shape
+                    if group_idx in current_M_rev_persist:
+                        mem_shape = current_M_rev_persist[group_idx].shape
+                        decay = self.memory_manager.calculate_reverse_decay_weights(
+                            reverse_chunk_index=reverse_chunk_idx, window_size=window_size,
+                            is_persistent=True, memory_shape=mem_shape, device=dev
+                        )
+                    else:
+                        # Should not happen if initialized correctly
+                        print(f"Warning: Group {group_idx} not found in current_M_rev_persist during decay calc.")
+
+                x, _, updated_rev, _gate_loss = layer(
+                    x,
+                    M_fwd_dict=M_fwd,
+                    M_rev_std_dict=M_rev_std,
+                    M_rev_persist_dict=current_M_rev_persist,  # Pass dict holding state to update
+                    group_id=group_idx,
+                    mode="persistent_reverse",
+                    control_tokens=ctrl,
+                    write_mask=None,
+                    decay_weights=decay
+                )
+
+                if updated_rev is not None:
+                    g_id, mem = updated_rev
+                    current_M_rev_persist[g_id] = mem  # Update the state for the next layer/chunk
+
+        # --- After processing all chunks in the window, update the main state ---
+        self.M_rev_persist = current_M_rev_persist
+
+    def _mask_persistent_memory(self, memory_dict: Dict[int, Tensor], p_drop: float) -> Dict[int, Tensor]:
+        """
+        Applies mask-future dropout to a *copy* of the persistent memory dictionary.
+        Zeros out rows along the memory dimension (M) with probability p_drop.
+        Returns a new dictionary with detached, cloned, masked tensors.
+        """
+        if p_drop <= 0.0:
+            return memory_dict  # No dropout needed, return original dict
+
+        masked_memory_dict = {}
+        for group_id, mem_tensor in memory_dict.items():
+            if mem_tensor is None or mem_tensor.numel() == 0:
+                masked_memory_dict[group_id] = mem_tensor  # Keep None or empty tensors as is
+                continue
+
+            B, M, D = mem_tensor.shape
+            if M == 0:  # Skip if memory dimension is zero
+                masked_memory_dict[group_id] = mem_tensor.clone().detach()
+                continue
+
+            # Create dropout mask along the memory dimension (M)
+            # Keep = 1, Drop = 0. Probability of keeping is (1 - p_drop)
+            keep_prob = 1.0 - p_drop
+            # Shape (B, M, 1) to broadcast across the embedding dim D
+            mask = torch.bernoulli(torch.full((B, M, 1), keep_prob, device=mem_tensor.device)).to(mem_tensor.dtype)
+
+            # Apply mask (element-wise multiplication)
+            # Clone and detach *before* masking to avoid modifying original and stop gradients
+            masked_tensor = mem_tensor.clone().detach() * mask
+            masked_memory_dict[group_id] = masked_tensor
+
+        return masked_memory_dict
 
     @torch.no_grad()
-    def generate(
-            self,
-            prompt: Union[str, List[int], List[List[int]], torch.Tensor, None] = None,
-            *,
-            max_new_tokens: int = 128,
-            temperature: float = 1.0,
-            top_k: Optional[int] = None,
-            stop_token_id: Optional[int] = None,
-            reset_state: bool = False,
-    ) -> List[int]:  # Modified return type
-        """
-        Autoregressive decoding driven entirely by `forward()`. Caches current chunk text.
+    def generate(self, prompt: Union[str, List[int], List[List[int]], torch.Tensor, None] = None, *,
+                 max_new_tokens: int = 128, temperature: float = 1.0, top_k: Optional[int] = None,
+                 stop_token_id: Optional[int] = None, reset_state: bool = False) -> List[int]:
+        """ Autoregressive decoding. """
+        if reset_state: print("Resetting model state for generation."); self.reset_state()
+        self._initialize_memory_states(force_reset=False)
 
-        • If `reset_state` is True, clears model state first.
-        • If `prompt` is not None/empty, it is fed through `forward()`.
-        • Initializes `self.current_chunk_text` based on any prompt residue.
-        • Each loop iteration then:
-            1.  feeds the token chosen in the previous step (or prompt on first
-                iteration) via `forward(next_input)`;
-            2.  receives logits for the *current* position (T > 0 guaranteed);
-            3.  samples the next token `next_id`;
-            4.  appends `next_id` to `generated` list;
-            5.  decodes `next_id` and appends to `self.current_chunk_text`;
-            6.  checks for periodic persistent reverse update using cached text;
-            7.  stores `[next_id]` to feed in step 1 of the next iteration.
-
-        Returns
-        -------
-        List[int], the list of generated token IDs.
-        """
-        if reset_state:
-            self.reset_state()
-
-        # Helper: temperature / top-k sampling for one logit row
         def _sample_row(row: torch.Tensor) -> int:
-            # Ensure row is float32 for topk and softmax stability
             row = row.float()
             if top_k is not None and top_k > 0:
-                # Handle potential case where vocab size < top_k
-                actual_k = min(top_k, row.shape[-1])
-                if actual_k > 0:
-                    thresh = torch.topk(row, actual_k).values[-1]
-                    row = torch.where(row < thresh,
-                                      torch.full_like(row, float("-inf")), row)
-            # Prevent division by zero or negative temperature
-            temp = max(float(temperature), 1e-5)
+                actual_k = min(top_k, row.shape[-1]);
+                if actual_k > 0: thresh = torch.topk(row, actual_k).values[-1]; row = torch.where(row < thresh,
+                                                                                                  torch.full_like(row,
+                                                                                                                  float(
+                                                                                                                      "-inf")),
+                                                                                                  row)
+            temp = max(float(temperature), 1e-5);
             probs = torch.nn.functional.softmax(row / temp, dim=-1)
             return torch.multinomial(probs, 1).item()
 
-        next_input = prompt  # first pass takes the prompt (may be None)
+        next_input = prompt
         generated: List[int] = []
-
-        # Initialize/Sync current_chunk_text after processing prompt
-        # This ensures the cache matches the buffer state before generation starts
-        if prompt not in (None, "", [], torch.tensor([], dtype=torch.long)):
-            # Process prompt first to update self.current_chunk_tokens
-            _ = self.forward(prompt, training_mode=False)  # Ignore logits here
-
-        # Now sync the text cache with the buffer state
-        if self.current_chunk_tokens:
-            try:
-                self.current_chunk_text = self.tokenizer.decode(self.current_chunk_tokens)
-            except Exception as e:
-                print(f"Warning: Error decoding initial buffer tokens: {e}")
-                self.current_chunk_text = ""  # Fallback
-        else:
+        if prompt not in (None, "", [], torch.tensor([], dtype=torch.long)): _ = self.forward(prompt,
+                                                                                              training_mode=False)
+        try:
+            self.current_chunk_text = self.tokenizer.decode(self.current_chunk_tokens)
+        except Exception as e:
+            print(f"Warning: Error decoding initial buffer tokens: {e}");
             self.current_chunk_text = ""
-
-        # Set next_input to None after processing the initial prompt for the loop
         next_input = None
 
         for _ in range(max_new_tokens):
-            # Step 1: Feed previous token (or None initially) into forward
-            # This updates state and potentially triggers flush
-            logits = self.forward(next_input, training_mode=False)
-
-            # Step 2: Check if logits are valid for sampling
-            T = logits.shape[1]
-            if T == 0:
-                # This happens if a flush left the open chunk empty.
-                print("INFO: Generation stopped because flush resulted in empty chunk.")
-                break
-
-            # Step 3: Sample the next token
+            logits, _ = self.forward(next_input, training_mode=False)
+            if logits.shape[1] == 0: print("INFO: Generation stopped - empty logits."); break
             next_id = _sample_row(logits[0, -1, :])
-
-            # Check stop condition before appending
-            if stop_token_id is not None and next_id == stop_token_id:
-                break
-
-            # Step 4: Store generated token ID
+            if stop_token_id is not None and next_id == stop_token_id: break
             generated.append(next_id)
-
-            # Step 5: Update the text cache for the current chunk
             try:
                 self.current_chunk_text += self.tokenizer.decode([next_id])
             except Exception as e:
                 print(f"Warning: Error decoding token {next_id}: {e}")
-                # Continue generation, but semantic check might be impaired
 
-            # Step 6: Check for Periodic Persistent Reverse Memory Update
             self.tokens_since_persistent_update += 1
             update_persist = False
-            # Check token count trigger
-            if self.config.persistent_reverse_update_freq_tokens is not None and \
-                    self.tokens_since_persistent_update >= self.config.persistent_reverse_update_freq_tokens:
-                update_persist = True
-
-            # Check semantic boundary trigger (using cached text)
-            if not update_persist and \
-                    self.config.persistent_reverse_update_freq_semantic and \
-                    len(self.current_chunk_text) > 1:  # Need some text to check
+            if self.config.persistent_reverse_update_freq_tokens is not None and self.tokens_since_persistent_update >= self.config.persistent_reverse_update_freq_tokens: update_persist = True
+            if not update_persist and self.config.persistent_reverse_update_freq_semantic and len(
+                    self.current_chunk_text) > 1:
                 try:
                     boundary_level = self.config.persistent_reverse_update_freq_semantic
                     if boundary_level in self.config.boundary_types:
-                        # Check near the end of the cached text (e.g., last 10 chars)
                         search_window = self.current_chunk_text[-10:]
                         for boundary_type in self.config.boundary_types[boundary_level]:
                             pattern = BOUNDARY_PATTERNS.get(boundary_type)
-                            if pattern and re.search(pattern, search_window):
-                                update_persist = True
-                                break  # Stop checking patterns once one is found
+                            if pattern and re.search(pattern, search_window): update_persist = True; break
                 except Exception as e:
                     print(f"Warning: Error during semantic boundary check: {e}")
 
             if update_persist:
-                # Compute persistent reverse using history + current buffer content
+                print("Triggering periodic persistent reverse update during generation.")
+                # Need to run the persistent reverse pass using current state
+                # Combine history + current buffer content
+                # Note: self.current_chunk_tokens is updated *after* forward returns the logit used
+                # to generate next_id, but *before* next_id is added to generated list.
+                # So, it represents the state *before* the latest token.
                 full_chunks_for_persist = self.closed_chunks + (
                     [self.current_chunk_tokens] if self.current_chunk_tokens else [])
-                self.M_rev_persist = self._compute_persistent_reverse_memory(
-                    full_chunks_for_persist,
-                    mask_future=False  # No mask-future during inference
-                )
-                self.tokens_since_persistent_update = 0  # Reset counter
+                if full_chunks_for_persist:  # Only run if there's history
+                    self._run_persistent_reverse_pass(full_chunks_for_persist, B=1,
+                                                      dev=self.token_embedding.weight.device)
+                else:
+                    print("Skipping periodic update: No history chunks available.")
+                self.tokens_since_persistent_update = 0
 
-            # Step 7: Prepare input for the next iteration
             next_input = [next_id]
-
         return generated
 
     def reset_state(self) -> None:
-        """Clear all sequence-level state before starting a new dialogue."""
+        """Clear all sequence-level state and reset memory dictionaries."""
+        print("Resetting CMAModel state.")
         self.closed_chunks = []
         self.current_chunk_tokens = []
-        self.M_fwd = None
-        self.M_rev_persist = None
-        self.current_chunk_text: str = ""
+        self.current_chunk_text = ""
+        self.total_tokens_processed = 0
+        self.tokens_since_persistent_update = 0
+        # Clear runtime memory state dictionaries
+        self.M_fwd = {}
+        self.M_rev_std = {}
+        self.M_rev_persist = {}
+        # Re-initialize from learned parameters on next use by calling _initialize_memory_states
+        # Or force re-initialization here? Let's rely on _initialize_memory_states in forward/generate.
 
     def set_training_step(self, step: int, total_steps: int):
         """Set current training step for mask-future scheduling"""

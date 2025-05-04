@@ -23,7 +23,7 @@ CMA processes sequences in chunks, maintaining compressed representations of pas
 *   **Layer Groups & Types:** Layers are organized into groups. Each group contains either zero memory layers, or exactly one **CMA memory-update layer**, optionally multiple **CMA read-only layers**, and optionally multiple **local-only layers**. (see 4.2).
 *   **Group-Specific Memory:** Each layer group containing a memory-update layer manages its own independent memory states.
 *   **Forward Memory (`M_fwd`):** A primary memory state accumulating context information as the model processes chunks sequentially forward during the Forward Pass. Persists across chunks within an update cycle.
-*   **Standard Reverse Memory (`M_rev_std`):** A memory state computed via a backward pass over recent chunks (including the current chunk) *before* the Forward Pass. Its purpose is to provide immediate preceding context to the Forward Pass. It is discarded after the Forward Pass completes.
+*   **Lookahead Reverse Memory (`M_rev_std`):** A memory state computed via a backward pass over recent chunks (including the current chunk) *before* the Forward Pass. Its purpose is to provide immediate preceding context to the Forward Pass. It is discarded after the Forward Pass completes.
 *   **Persistent Reverse Memory (`M_rev_persist`):** A backward memory state computed over recent chunks *excluding* the current chunk, calculated *after* the Forward Pass. It is maintained between full update cycles (e.g., during streaming generation) to provide continuity and access to recent context not yet consolidated into forward memory.
 *   **Adaptive Gating:** A mechanism allowing the model to dynamically control the influence of memory components per token (see 5).
 *   **Control Tokens:** Scalar values fused to queries indicating operational mode and progress (see 4.5).
@@ -88,7 +88,7 @@ CMA processes sequences in chunks, maintaining compressed representations of pas
 *   **Group-Specific Memory:** Each layer group containing a CMA memory-update layer manages its own independent set of memory state tensors: `M_fwd`, `M_rev_std`, `M_rev_persist`.
 *   **Shapes:**
     *   Forward Memory (`M_fwd`): `(B, max_memory_size, D)`. Write access is dynamically scaled (see 8), read access is always to the full size.
-    *   Standard Reverse Memory (`M_rev_std`): `(B, reverse_memory_size, D)`. Fixed size.
+    *   Lookahead Reverse Memory (`M_rev_std`): `(B, reverse_memory_size, D)`. Fixed size.
     *   Persistent Reverse Memory (`M_rev_persist`): `(B, reverse_memory_size, D)`. Fixed size.
 *   **Initialization:**
     *   Each memory state tensor (`M_fwd`, `M_rev_std`, `M_rev_persist`) for each group is initialized from a corresponding **learned initial state tensor** of the same shape (`initial_M_fwd`, `initial_M_rev_std`, `initial_M_rev_persist`).
@@ -104,16 +104,16 @@ A full memory update cycle is triggered **once per input sequence** (e.g., docum
 1.  **Preparation:**
     *   **Re-Chunk:** Perform reverse-semantic-with-gap (or fixed-size) chunking (as described in 4.1) over the *entire* current sequence to define new, consistent chunk boundaries. Let the last chunk be chunk `N`.
     *   **(Default) Reset Memory:** Reset `M_fwd`, `M_rev_std`, and `M_rev_persist` for all groups to their learned initial states (unless persistence across cycles is enabled).
-    *   **Update Control Tokens:** Initialize control tokens for the Standard Reverse Pass (see 4.5).
+    *   **Update Control Tokens:** Initialize control tokens for the Lookahead Reverse Pass (see 4.5).
 
-2.  **Pass 1: Standard Reverse Pass (`M_rev_std` Computation)**
+2.  **Pass 1: Lookahead Reverse Pass (`M_rev_std` Computation)**
     *   **Purpose:** Compute `M_rev_std` to provide lookahead context (from the current chunk backward) for the subsequent Forward Pass.
     *   **Direction:** Processes chunks backward, starting from the end of the sequence (chunk `N`).
     *   **Scope:** Includes the current chunk `N` and proceeds backward (`N, N-1, ..., N-k+1`) up to `reverse_max_chunks` or the start of the sequence. Uses the newly defined boundaries.
     *   **Processing:** For each chunk in the reverse scope:
         *   Pass the chunk through all layers of the model sequentially.
         *   **Attention:** CMA layers (update and read-only) attend to the current chunk's tokens, the *current* state of `M_rev_std` for their group, and the control tokens.
-        *   **Memory Update:** Only the **CMA memory-update layer** in each group updates its group's `M_rev_std` state based on the processing of this chunk, using the standard reverse decay parameters (see 7) and the memory update mechanism (see 6).
+        *   **Memory Update:** Only the **CMA memory-update layer** in each group updates its group's `M_rev_std` state based on the processing of this chunk, using the Lookahead Reverse decay parameters (see 7) and the memory update mechanism (see 6).
     *   **Result:** The final `M_rev_std` state for each group is stored temporarily.
 
 3.  **Pass 2: Forward Pass (`M_fwd` Computation)**
@@ -148,7 +148,7 @@ A full memory update cycle is triggered **once per input sequence** (e.g., docum
         *   Fuse control tokens (reflecting mid-chunk generation mode, ratio flags continue to update) to the query projection (see 4.5).
         *   Generate the next token. Append it to `X_partial`.
         *   **No memory updates occur during mid-chunk generation.**
-    3.  **Periodic Persistent Reverse Memory Update (Optional):** Can be triggered independently by token count (`persistent_reverse_update_freq['tokens']`) or semantic signal since the *last* persistent update. This re-runs *only* Pass 3 (Persistent Reverse Pass) over chunks `N-1, N-2, ...` (using the *existing* boundaries, excluding the current partial chunk `N`) to update `M_rev_persist` for all groups. Does *not* trigger Standard Reverse or Forward passes and does not reset memory.
+    3.  **Periodic Persistent Reverse Memory Update (Optional):** Can be triggered independently by token count (`persistent_reverse_update_freq['tokens']`) or semantic signal since the *last* persistent update. This re-runs *only* Pass 3 (Persistent Reverse Pass) over chunks `N-1, N-2, ...` (using the *existing* boundaries, excluding the current partial chunk `N`) to update `M_rev_persist` for all groups. Does *not* trigger Lookahead Reverse or Forward passes and does not reset memory.
 
 * **Training/Inference Parity (Persistent Reverse Memory):**
   - During training, explicitly simulate inference conditions by applying random *mask-future dropout* to the persistent reverse memory state (`M_rev_persist`) provided during the Forward Pass (Pass 2). When simulating the processing of chunk `i` in the forward pass, instead of always providing the `M_rev_persist` computed from ground truth future chunks (`i-1, i-2, …`), occasionally mask or omit parts of this memory with probability `p_mask_future`. This mitigates exposure bias. *Note: This applies to the M_rev_persist used as context during generation/forward passes, not during its own computation in Pass 3.*
@@ -161,7 +161,7 @@ A full memory update cycle is triggered **once per input sequence** (e.g., docum
 Before processing each chunk (or generating a token), several scalar float values representing the current mode of operation and progress are fused to the query projection in CMA layers:
 
 *   **Generation Flag:** Indicates whether the model is currently processing memory during a full update cycle (0.0), or streaming/generating mid-chunk (1.0).
-*   **Memory Mode Flag:** Indicates the current pass within the update cycle or generation mode (e.g., `0.0` for Forward Pass, `1.0` for Standard Reverse Pass, `0.8` for Persistent Reverse Pass/Update, potentially another value like `0.5` for mid-chunk generation).
+*   **Memory Mode Flag:** Indicates the current pass within the update cycle or generation mode (e.g., `0.0` for Forward Pass, `1.0` for Lookahead Reverse Pass, `0.8` for Persistent Reverse Pass/Update, potentially another value like `0.5` for mid-chunk generation).
 *   **Memory Usage Ratio (`current_mem / max_mem`):** Ratio of the currently *writable* effective forward memory size to the maximum possible forward memory size (`max_memory_size`).
 *   **Memory Density Ratio (`current_mem / seq_len`):** Ratio of currently writable forward memory size to the total sequence length processed so far (in tokens).
 *   **Chunk Position Ratio:**
@@ -232,12 +232,12 @@ This mechanism is implemented *only* within **CMA memory-update layers** and app
 
 Two distinct reverse passes compute `M_rev_std` and `M_rev_persist` respectively, using the same underlying chunk boundaries defined by the most recent re-chunking event. They share configuration parameters like `reverse_memory_size` and `reverse_max_chunks` but have separate decay parameters and update weights.
 
-*   **Standard Reverse Pass (`M_rev_std`)**
+*   **Lookahead Reverse Pass (`M_rev_std`)**
     *   **Purpose:** Provide immediate preceding context (including the current chunk) to the Forward Pass.
     *   **Timing:** Runs *once* per full update cycle, *before* the Forward Pass (Pass 1).
     *   **Scope:** Includes the current chunk (`N`) and processes backward (`N, N-1, ...`) up to `reverse_max_chunks`.
     *   **Attention Context:** Attends to current chunk tokens + current `M_rev_std`.
-    *   **Update:** Updates `M_rev_std` using the shared reverse memory update parameters and specific `standard_reverse_decay_step`, `standard_reverse_decay_rate` for downweighting during the update calculation.
+    *   **Update:** Updates `M_rev_std` using the shared reverse memory update parameters and specific `Lookahead_reverse_decay_step`, `Lookahead_reverse_decay_rate` for downweighting during the update calculation.
     *   **Persistence:** The resulting `M_rev_std` is used only by the subsequent Forward Pass and then discarded.
 
 *   **Persistent Reverse Pass (`M_rev_persist`)**
@@ -265,7 +265,7 @@ Two distinct reverse passes compute `M_rev_std` and `M_rev_persist` respectively
 
 **9. Training Methodology**
 
-*   **Chunked Processing & Update Cycle Simulation:** Training data is processed simulating the inference flow. Sequences are chunked using the chosen method (e.g., reverse-semantic-with-gap). The model processes chunks sequentially. When processing reaches the point where the *current* chunk would be considered "filled" (i.e., reaches `chunk_size`), the **full memory update cycle** (Standard Reverse -> Forward -> Persistent Reverse) is simulated using the ground truth sequence data.
+*   **Chunked Processing & Update Cycle Simulation:** Training data is processed simulating the inference flow. Sequences are chunked using the chosen method (e.g., reverse-semantic-with-gap). The model processes chunks sequentially. When processing reaches the point where the *current* chunk would be considered "filled" (i.e., reaches `chunk_size`), the **full memory update cycle** (Lookahead Reverse -> Forward -> Persistent Reverse) is simulated using the ground truth sequence data.
     *   Memory states are reset (by default) at the start of simulating each sequence's update cycle(s).
     *   Loss is calculated based on predictions made during the **Forward Pass** (Pass 2).
 *   **Curriculum Learning:** Gradually increase `chunk_size` (if dynamic sizing is used), `max_memory_size` (or its scaling cap), and sequence length during training.
