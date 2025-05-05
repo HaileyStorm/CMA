@@ -78,8 +78,8 @@ def basic_config_dict() -> Dict[str, Any]:
         "output_proj_zero_init": False, # Easier to test if not zero
         "gate_regularization_type": "l1",
         "gate_regularization_strength": 0.0001,
-        "mask_future_schedule": (0.2, 0.8),
-        "mask_future_rates": (0.1, 0.5, 0.9),
+        "mask_future_schedule": [0.2, 0.8],
+        "mask_future_rates": [0.1, 0.5, 0.9],
         "enable_mask_future_dropout": True,
     }
 
@@ -164,6 +164,19 @@ def create_dummy_rev_memory_dict(model: CMAModel, batch_size: int = 1) -> Dict[i
             ) * model.config.memory_init_scale
     return mem_dict
 
+def convert_tuples_to_lists(data):
+    """Recursively converts tuples to lists within a nested structure."""
+    if isinstance(data, dict):
+        return {k: convert_tuples_to_lists(v) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [convert_tuples_to_lists(item) for item in data]
+    elif isinstance(data, tuple):
+        # Convert tuple to list
+        return [convert_tuples_to_lists(item) for item in data]
+    else:
+        # Keep other types as is
+        return data
+
 # --- Test Classes ---
 
 class TestCMAConfig:
@@ -185,12 +198,33 @@ class TestCMAConfig:
 
     def test_instantiation_from_yaml(self, basic_config_dict, tmp_path):
         yaml_file = tmp_path / "cma_config.yaml"
+
+        # Convert tuples to lists *before* dumping to YAML
+        dict_to_dump = convert_tuples_to_lists(basic_config_dict)
+
         with open(yaml_file, 'w') as f:
-            yaml.dump(basic_config_dict, f)
+            # Dump the modified dictionary (no !python/tuple tags will be generated)
+            yaml.dump(dict_to_dump, f, default_flow_style=False)
+
+        # Load using the existing from_yaml method (which uses safe_load)
         config = CMAConfig.from_yaml(yaml_file)
+
+        # Basic assertions
         assert config.chunk_size == CHUNK_SIZE
         assert config.embed_dim == EMBED_DIM
         assert config.layer_structure is not None
+
+        # Verify that the fields loaded from lists are converted back to tuples by the dataclass
+        print(type(config.mask_future_schedule))
+        assert isinstance(config.mask_future_schedule, list)
+        assert config.mask_future_schedule == basic_config_dict['mask_future_schedule']  # Compare value
+        assert isinstance(config.mask_future_rates, list)
+        assert config.mask_future_rates == basic_config_dict['mask_future_rates']  # Compare value
+
+        # Verify that fields originally intended as lists remain lists
+        assert isinstance(config.boundary_search_chars, list)
+        assert config.boundary_search_chars == basic_config_dict['boundary_search_chars']
+        assert isinstance(config.layer_structure, list)
 
     def test_validation_failures(self, basic_config_dict):
         # Test invalid percentage
@@ -1008,7 +1042,7 @@ class TestUtilities:
 
 # 4.3 Memory States and Initialization
 # - Group-Specific Memory -> Checked implicitly by passing dicts in `TestBlock`, `TestCMAModel` tests
-# - Shapes (M_fwd, M_rev_std, M_rev_persist) -> Checked in `TestMemoryManager`, `TestAttentionLayers`, `TestBlock`, `TestCMAModel` where memory is handled
+# - Shapes (M_fwd, M_rev_ahead, M_rev_persist) -> Checked in `TestMemoryManager`, `TestAttentionLayers`, `TestBlock`, `TestCMAModel` where memory is handled
 # - Learned Initial State Tensors -> `TestCMAModel.test_model_instantiation_basic`, `TestCMAModel.test_model_instantiation_grouped` check existence
 # - Dedicated vs Shared Initial States -> `TestCMAModel.test_model_instantiation_basic`, `TestCMAModel.test_model_instantiation_grouped`
 # - Reset Behavior (Default: Reset on Cycle) -> `TestCMAModel.test_forward_trigger_cycle` (checks memory changes from initial), `TestCMAModel.test_reset_state`
@@ -1017,8 +1051,8 @@ class TestUtilities:
 # - Trigger Condition -> `TestCMAModel.test_forward_trigger_cycle`
 # - Re-Chunk -> Tested implicitly by `TestCMAModel.test_forward_trigger_cycle` calling chunker
 # - Reset Memory (Default) -> Tested implicitly by `TestCMAModel.test_forward_trigger_cycle` starting from initial states
-# - Pass 1: Lookahead Reverse (`M_rev_std` computation) -> Tested indirectly. Cycle completion implies it ran. `TestBlock.test_update_block_reverse_pass` checks reverse update logic.
-# - Pass 2: Forward (`M_fwd` computation) -> `TestCMAModel.test_forward_trigger_cycle` checks `M_fwd` update. `TestBlock.test_update_block_forward_pass` checks forward update logic. Uses `M_rev_std` (checked via `TestBlock` forward pass taking rev mem).
+# - Pass 1: Lookahead Reverse (`M_rev_ahead` computation) -> Tested indirectly. Cycle completion implies it ran. `TestBlock.test_update_block_reverse_pass` checks reverse update logic.
+# - Pass 2: Forward (`M_fwd` computation) -> `TestCMAModel.test_forward_trigger_cycle` checks `M_fwd` update. `TestBlock.test_update_block_forward_pass` checks forward update logic. Uses `M_rev_ahead` (checked via `TestBlock` forward pass taking rev mem).
 # - Pass 3: Persistent Reverse (`M_rev_persist` computation) -> `TestCMAModel.test_forward_trigger_cycle` checks `M_rev_persist` update. `TestBlock.test_update_block_reverse_pass` checks reverse update logic (using persistent mode).
 # - Streaming Generation (Mid-Chunk) -> `TestCMAModel.test_forward_no_cycle_streaming`, `TestCMAModel.test_generate_basic`
 # - No memory updates mid-chunk -> `TestCMAModel.test_forward_no_cycle_streaming` checks memory state unchanged
@@ -1051,7 +1085,7 @@ class TestUtilities:
 # - Parameter Separation (Fwd vs Rev) -> `TestAttentionLayers.test_cma_attention_forward_memory_update` tests both update types work. Assumes separate params exist.
 
 # 7. Reverse Memory Details
-# - Lookahead Reverse Pass (`M_rev_std`) -> See 4.4 Pass 1
+# - Lookahead Reverse Pass (`M_rev_ahead`) -> See 4.4 Pass 1
 # - Persistent Reverse Pass (`M_rev_persist`) -> See 4.4 Pass 3
 # - Decay Parameters -> `TestMemoryManager.test_calculate_reverse_decay_weights` tests calculation. `TestAttentionLayers.test_cma_attention_forward_memory_update` tests usage (indirectly).
 

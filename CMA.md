@@ -23,7 +23,7 @@ CMA processes sequences in chunks, maintaining compressed representations of pas
 *   **Layer Groups & Types:** Layers are organized into groups. Each group contains either zero memory layers, or exactly one **CMA memory-update layer**, optionally multiple **CMA read-only layers**, and optionally multiple **local-only layers**. (see 4.2).
 *   **Group-Specific Memory:** Each layer group containing a memory-update layer manages its own independent memory states.
 *   **Forward Memory (`M_fwd`):** A primary memory state accumulating context information as the model processes chunks sequentially forward during the Forward Pass. Persists across chunks within an update cycle.
-*   **Lookahead Reverse Memory (`M_rev_std`):** A memory state computed via a backward pass over recent chunks (including the current chunk) *before* the Forward Pass. Its purpose is to provide immediate preceding context to the Forward Pass. It is discarded after the Forward Pass completes.
+*   **Lookahead Reverse Memory (`M_rev_ahead`):** A memory state computed via a backward pass over recent chunks (including the current chunk) *before* the Forward Pass. Its purpose is to provide immediate preceding context to the Forward Pass. It is discarded after the Forward Pass completes.
 *   **Persistent Reverse Memory (`M_rev_persist`):** A backward memory state computed over recent chunks *excluding* the current chunk, calculated *after* the Forward Pass. It is maintained between full update cycles (e.g., during streaming generation) to provide continuity and access to recent context not yet consolidated into forward memory.
 *   **Adaptive Gating:** A mechanism allowing the model to dynamically control the influence of memory components per token (see 5).
 *   **Control Tokens:** Scalar values fused to queries indicating operational mode and progress (see 4.5).
@@ -85,17 +85,17 @@ CMA processes sequences in chunks, maintaining compressed representations of pas
 
 **4.3. Memory States and Initialization**
 
-*   **Group-Specific Memory:** Each layer group containing a CMA memory-update layer manages its own independent set of memory state tensors: `M_fwd`, `M_rev_std`, `M_rev_persist`.
+*   **Group-Specific Memory:** Each layer group containing a CMA memory-update layer manages its own independent set of memory state tensors: `M_fwd`, `M_rev_ahead`, `M_rev_persist`.
 *   **Shapes:**
     *   Forward Memory (`M_fwd`): `(B, max_memory_size, D)`. Write access is dynamically scaled (see 8), read access is always to the full size.
-    *   Lookahead Reverse Memory (`M_rev_std`): `(B, reverse_memory_size, D)`. Fixed size.
+    *   Lookahead Reverse Memory (`M_rev_ahead`): `(B, reverse_memory_size, D)`. Fixed size.
     *   Persistent Reverse Memory (`M_rev_persist`): `(B, reverse_memory_size, D)`. Fixed size.
 *   **Initialization:**
-    *   Each memory state tensor (`M_fwd`, `M_rev_std`, `M_rev_persist`) for each group is initialized from a corresponding **learned initial state tensor** of the same shape (`initial_M_fwd`, `initial_M_rev_std`, `initial_M_rev_persist`).
+    *   Each memory state tensor (`M_fwd`, `M_rev_ahead`, `M_rev_persist`) for each group is initialized from a corresponding **learned initial state tensor** of the same shape (`initial_M_fwd`, `initial_M_rev_ahead`, `initial_M_rev_persist`).
     *   These initial state tensors are parameters of the model, updated during training.
     *   **Default:** Each group (identified by its CMA memory-update layer) has its *own dedicated set* of learned initial state parameters.
     *   **Option:** A configuration flag can allow sharing these initial state parameters globally across all groups.
-*   **Reset Behavior:** By default, at the beginning of each full memory update cycle (see 4.4), all active memory states (`M_fwd`, `M_rev_std`, `M_rev_persist`) for all groups are **reset** to their respective learned initial state values. An optional configuration can disable this reset, allowing memory states to persist across update cycles (useful for continuous processing scenarios, only resetting on explicit command or model load).
+*   **Reset Behavior:** By default, at the beginning of each full memory update cycle (see 4.4), all active memory states (`M_fwd`, `M_rev_ahead`, `M_rev_persist`) for all groups are **reset** to their respective learned initial state values. An optional configuration can disable this reset, allowing memory states to persist across update cycles (useful for continuous processing scenarios, only resetting on explicit command or model load).
 
 **4.4. Processing Flow: The Full Memory Update Cycle**
 
@@ -103,18 +103,18 @@ A full memory update cycle is triggered **once per input sequence** (e.g., docum
 
 1.  **Preparation:**
     *   **Re-Chunk:** Perform reverse-semantic-with-gap (or fixed-size) chunking (as described in 4.1) over the *entire* current sequence to define new, consistent chunk boundaries. Let the last chunk be chunk `N`.
-    *   **(Default) Reset Memory:** Reset `M_fwd`, `M_rev_std`, and `M_rev_persist` for all groups to their learned initial states (unless persistence across cycles is enabled).
+    *   **(Default) Reset Memory:** Reset `M_fwd`, `M_rev_ahead`, and `M_rev_persist` for all groups to their learned initial states (unless persistence across cycles is enabled).
     *   **Update Control Tokens:** Initialize control tokens for the Lookahead Reverse Pass (see 4.5).
 
-2.  **Pass 1: Lookahead Reverse Pass (`M_rev_std` Computation)**
-    *   **Purpose:** Compute `M_rev_std` to provide lookahead context (from the current chunk backward) for the subsequent Forward Pass.
+2.  **Pass 1: Lookahead Reverse Pass (`M_rev_ahead` Computation)**
+    *   **Purpose:** Compute `M_rev_ahead` to provide lookahead context (from the current chunk backward) for the subsequent Forward Pass.
     *   **Direction:** Processes chunks backward, starting from the end of the sequence (chunk `N`).
     *   **Scope:** Includes the current chunk `N` and proceeds backward (`N, N-1, ..., N-k+1`) up to `reverse_max_chunks` or the start of the sequence. Uses the newly defined boundaries.
     *   **Processing:** For each chunk in the reverse scope:
         *   Pass the chunk through all layers of the model sequentially.
-        *   **Attention:** CMA layers (update and read-only) attend to the current chunk's tokens, the *current* state of `M_rev_std` for their group, and the control tokens.
-        *   **Memory Update:** Only the **CMA memory-update layer** in each group updates its group's `M_rev_std` state based on the processing of this chunk, using the Lookahead Reverse decay parameters (see 7) and the memory update mechanism (see 6).
-    *   **Result:** The final `M_rev_std` state for each group is stored temporarily.
+        *   **Attention:** CMA layers (update and read-only) attend to the current chunk's tokens, the *current* state of `M_rev_ahead` for their group, and the control tokens.
+        *   **Memory Update:** Only the **CMA memory-update layer** in each group updates its group's `M_rev_ahead` state based on the processing of this chunk, using the Lookahead Reverse decay parameters (see 7) and the memory update mechanism (see 6).
+    *   **Result:** The final `M_rev_ahead` state for each group is stored temporarily.
 
 3.  **Pass 2: Forward Pass (`M_fwd` Computation)**
     *   **Purpose:** Process the sequence chronologically and update the main forward memory state `M_fwd`.
@@ -122,9 +122,9 @@ A full memory update cycle is triggered **once per input sequence** (e.g., docum
     *   **Processing:** For each chunk from 0 to `N`:
         *   Update control tokens for the Forward Pass.
         *   Pass the chunk through all layers of the model sequentially.
-        *   **Attention:** CMA layers (update and read-only) attend to the current chunk's tokens, the *current* state of `M_fwd` for their group, the *final* `M_rev_std` computed in Pass 1 (read-only), and the control tokens.
+        *   **Attention:** CMA layers (update and read-only) attend to the current chunk's tokens, the *current* state of `M_fwd` for their group, the *final* `M_rev_ahead` computed in Pass 1 (read-only), and the control tokens.
         *   **Memory Update:** Only the **CMA memory-update layer** in each group updates its group's `M_fwd` state based on the processing of this chunk, using the memory update mechanism (see 6). The updated `M_fwd` is carried over to the next chunk in this pass.
-    *   **Result:** The final `M_fwd` state for each group (after processing chunk `N`) is stored for subsequent generation steps. The `M_rev_std` computed in Pass 1 is now discarded.
+    *   **Result:** The final `M_fwd` state for each group (after processing chunk `N`) is stored for subsequent generation steps. The `M_rev_ahead` computed in Pass 1 is now discarded.
 
 4.  **Pass 3: Persistent Reverse Pass (`M_rev_persist` Computation)**
     *   **Purpose:** Compute `M_rev_persist` to provide recent context (excluding the current chunk) for subsequent generation steps between full update cycles.
@@ -187,12 +187,12 @@ These signals allow the model (specifically the CMA layers) to adapt its behavio
 
 A `CascadeMemoryAttention` layer integrates chunk and memory information. This applies to both **memory-update** and **read-only** CMA layer types.
 
-*   **Input:** `chunk_input (B, current_chunk_len, D)` (full chunk during update cycles, partial during streaming), memory states (`M_fwd`, `M_rev_std`, `M_rev_persist` as relevant for the current pass/mode, sourced from the layer's group), `control_tokens (vector)`.
+*   **Input:** `chunk_input (B, current_chunk_len, D)` (full chunk during update cycles, partial during streaming), memory states (`M_fwd`, `M_rev_ahead`, `M_rev_persist` as relevant for the current pass/mode, sourced from the layer's group), `control_tokens (vector)`.
 *   **QKV Projections:** Standard linear projections.
     *   **Query Source:** Derived from `chunk_input` (full chunk) during update cycle passes. Derived from the *next token position's embedding* relative to `chunk_input` (partial chunk) during streaming generation. Control tokens are fused into the Query projection (see 4.5).
     *   **Key/Value Source:** Derived from `chunk_input` concatenated with the relevant memory states for the current pass/mode.
-        *   *Std Reverse Pass:* `chunk_input` + `M_rev_std` (current state).
-        *   *Forward Pass:* `chunk_input` + `M_fwd` (current state) + `M_rev_std` (final state from Pass 1).
+        *   *Std Reverse Pass:* `chunk_input` + `M_rev_ahead` (current state).
+        *   *Forward Pass:* `chunk_input` + `M_fwd` (current state) + `M_rev_ahead` (final state from Pass 1).
         *   *Persist Reverse Pass:* `chunk_input` + `M_rev_persist` (current state).
         *   *Streaming Generation:* `chunk_input` (partial) + `M_fwd` (final from Pass 2) + `M_rev_persist` (final from Pass 3 or last periodic update).
 *   **Memory Integration:** Memory tokens are prepended (or appended) to the `chunk_input` along the sequence length dimension before Key/Value projection.
@@ -211,7 +211,7 @@ A `CascadeMemoryAttention` layer integrates chunk and memory information. This a
 
 **6. Memory Update Mechanism**
 
-This mechanism is implemented *only* within **CMA memory-update layers** and applies to the specific memory state being updated in the current pass (`M_fwd`, `M_rev_std`, or `M_rev_persist`) for that layer's group.
+This mechanism is implemented *only* within **CMA memory-update layers** and applies to the specific memory state being updated in the current pass (`M_fwd`, `M_rev_ahead`, or `M_rev_persist`) for that layer's group.
 
 1.  **Compute Memory Delta (`delta`):** Use an attention mechanism where the *query* is derived from the current memory state being updated (`M_old`), and the *keys/values* are derived from the current chunk's token representations (`X`) after passing through the preceding layers.
     ```
@@ -226,19 +226,19 @@ This mechanism is implemented *only* within **CMA memory-update layers** and app
     Where `f_gate` is a learned transformation.
 3.  **Parameter Separation:**
     *   The forward memory update (`M_fwd`) uses one set of parameters (`f_q, f_k, f_v, f_gate`).
-    *   Both reverse memory updates (`M_rev_std`, `M_rev_persist`) share a *separate* set of parameters (`f_q_rev, f_k_rev, f_v_rev, f_gate_rev`).
+    *   Both reverse memory updates (`M_rev_ahead`, `M_rev_persist`) share a *separate* set of parameters (`f_q_rev, f_k_rev, f_v_rev, f_gate_rev`).
 
 **7. Reverse Memory Details**
 
-Two distinct reverse passes compute `M_rev_std` and `M_rev_persist` respectively, using the same underlying chunk boundaries defined by the most recent re-chunking event. They share configuration parameters like `reverse_memory_size` and `reverse_max_chunks` but have separate decay parameters and update weights.
+Two distinct reverse passes compute `M_rev_ahead` and `M_rev_persist` respectively, using the same underlying chunk boundaries defined by the most recent re-chunking event. They share configuration parameters like `reverse_memory_size` and `reverse_max_chunks` but have separate decay parameters and update weights.
 
-*   **Lookahead Reverse Pass (`M_rev_std`)**
+*   **Lookahead Reverse Pass (`M_rev_ahead`)**
     *   **Purpose:** Provide immediate preceding context (including the current chunk) to the Forward Pass.
     *   **Timing:** Runs *once* per full update cycle, *before* the Forward Pass (Pass 1).
     *   **Scope:** Includes the current chunk (`N`) and processes backward (`N, N-1, ...`) up to `reverse_max_chunks`.
-    *   **Attention Context:** Attends to current chunk tokens + current `M_rev_std`.
-    *   **Update:** Updates `M_rev_std` using the shared reverse memory update parameters and specific `Lookahead_reverse_decay_step`, `Lookahead_reverse_decay_rate` for downweighting during the update calculation.
-    *   **Persistence:** The resulting `M_rev_std` is used only by the subsequent Forward Pass and then discarded.
+    *   **Attention Context:** Attends to current chunk tokens + current `M_rev_ahead`.
+    *   **Update:** Updates `M_rev_ahead` using the shared reverse memory update parameters and specific `Lookahead_reverse_decay_step`, `Lookahead_reverse_decay_rate` for downweighting during the update calculation.
+    *   **Persistence:** The resulting `M_rev_ahead` is used only by the subsequent Forward Pass and then discarded.
 
 *   **Persistent Reverse Pass (`M_rev_persist`)**
     *   **Purpose:** Maintain recent context (excluding the current chunk) for use during streaming generation between full update cycles.
@@ -255,7 +255,7 @@ Two distinct reverse passes compute `M_rev_std` and `M_rev_persist` respectively
     *   The *effective* number of forward memory tokens that can be *written to* during updates is controlled dynamically via attention masking, based on the total sequence length (scaling up to 100% write access at a configured length).
     *   Within this sequence-determined write cap, the portion actually writable may also grow progressively as chunks are processed in the forward pass (optional, from `initial_write_fraction` up to the cap). Write updates are masked accordingly.
     *   Read access during attention is always to the full `max_memory_size` (masked appropriately if parts haven't been written yet). This ensures compatibility with `torch.compile`.
-*   **Reverse Memory (`M_rev_std`, `M_rev_persist`): Fixed Size**
+*   **Reverse Memory (`M_rev_ahead`, `M_rev_persist`): Fixed Size**
     *   Reverse memory states are computed based on a fixed window (`reverse_max_chunks`) and have a fixed size (`reverse_memory_size`).
     *   Their usage and updates are controlled through attention masks and gating, but their size does not scale dynamically with the total sequence length in the current design (see 12 for future enhancement).
 *   **VRAM/Compute Optimizations (Optional):**
@@ -318,7 +318,7 @@ This structure allows for targeted replacement and weight reuse.
 The core idea is to map Gemma's attention layers to the defined CMA layer types and organize them into groups:
 
 *   **Gemma Sliding Window Attention (SWA) Layers -> Local-Only Attention Layers:** These layers within the modified model will perform full attention *within* the defined `chunk_size`. They do not interact with memory and can belong to any group or no explicit group.
-*   **Gemma Global Attention (GA) Layers -> CMA Memory-Update Layers:** These layers will be responsible for reading from and writing to the CMA memory states. Each original GA layer becomes the single **memory-update layer** for its own **layer group**. It will manage its group's dedicated `M_fwd`, `M_rev_std`, and `M_rev_persist` states. Their original weights are discarded.
+*   **Gemma Global Attention (GA) Layers -> CMA Memory-Update Layers:** These layers will be responsible for reading from and writing to the CMA memory states. Each original GA layer becomes the single **memory-update layer** for its own **layer group**. It will manage its group's dedicated `M_fwd`, `M_rev_ahead`, and `M_rev_persist` states. Their original weights are discarded.
 *   **CMA Read-Only Layers:** Not directly mapped from Gemma layers in this basic strategy. If desired, some SWA or GA layers could potentially be converted to read-only layers, but they would need to be explicitly assigned to a group containing a memory-update layer.
 
 Other layers (MLPs/FFNs, embeddings, normalization layers - initially) remain unchanged and can be considered part of the groups containing the memory-update layers for organizational purposes.
@@ -333,7 +333,7 @@ Other layers (MLPs/FFNs, embeddings, normalization layers - initially) remain un
 
 *   **Local-Only Layers (from SWA):** Initialize directly with corresponding Gemma SWA weights. Freeze initially.
 *   **CMA Memory-Update Layers (from GA):** Discard original GA weights. Initialize randomly or using standard techniques. Train from the start.
-*   **Memory States (`M_fwd`, `M_rev_std`, `M_rev_persist`):** Initialize the **learned initial state tensors** for each group (associated with each former GA layer) near zero or randomly. Train from the start.
+*   **Memory States (`M_fwd`, `M_rev_ahead`, `M_rev_persist`):** Initialize the **learned initial state tensors** for each group (associated with each former GA layer) near zero or randomly. Train from the start.
 *   **Other Components:** Retain original weights (MLPs, embeddings, LayerNorms). Freeze initially.
 
 **11.6 Phased Training and Unfreezing Schedule**
@@ -382,7 +382,7 @@ While the proposed CMA architecture offers significant advancements in handling 
     * **Benefit:** Enables genuine personalization, continuous learning within a user's context, and the ability to handle tasks requiring knowledge accumulated over days, weeks, or longer.
 
 *   **Scaling Reverse Memory Write Access:**
-    *   **Concept:** Apply a progressive write access scaling mechanism, similar to that used for forward memory (`M_fwd`), to the reverse memory states (`M_rev_std` and `M_rev_persist`).
+    *   **Concept:** Apply a progressive write access scaling mechanism, similar to that used for forward memory (`M_fwd`), to the reverse memory states (`M_rev_ahead` and `M_rev_persist`).
     *   **Implementation:** While the full `reverse_memory_size` would still be allocated, the portion of this memory that is *writable* during memory updates in the reverse passes would scale based on the total sequence length processed (or the length of the context relevant to the reverse pass), potentially mirroring the schedule defined for `M_fwd`. Read access would remain to the full effective size determined by masking.
     *   **Benefit:** Creates symmetry in memory handling, potentially improving learning dynamics by preventing aggressive overwriting of fixed-size reverse memory early in long sequences. Aligns the growth of writable context representation capacity across memory types.
 
