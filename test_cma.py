@@ -3,11 +3,8 @@ import torch
 import torch.nn as nn
 import tiktoken
 import yaml
-import tempfile
-import os
 import math
-from pathlib import Path
-from typing import List, Dict, Any
+from typing import Dict, Any
 
 # Assuming cma.py is in the same directory or accessible via PYTHONPATH
 from cma import (
@@ -527,39 +524,68 @@ class TestMemoryManager:
         assert 0 <= effective_size <= config.max_memory_size
 
     def test_get_write_mask(self, manager, basic_config):
-        B = 2
+        print("\nTesting write mask progression...")
+        B = 1 # Keep batch size simple for this test
         dev = get_device()
-        # Test early chunk, low total processed
-        mask1 = manager.get_write_mask(
-            current_chunk_idx_in_pass=0, total_chunks_in_pass=10,
-            total_tokens_processed_before_chunk=CHUNK_SIZE, # Only 1 chunk processed before
-            batch_size=B, device=dev
-        )
-        seq_cap1 = manager.get_effective_size(CHUNK_SIZE)
-        chunk_prog_frac1 = basic_config.initial_write_fraction + (1.0 - basic_config.initial_write_fraction) * (1/10)
-        target_writable1 = int(MAX_MEM_SIZE * chunk_prog_frac1)
-        expected_writable1 = min(seq_cap1, target_writable1)
+        total_chunks_in_pass = 4 # Example number of chunks in a pass
+        tokens_per_chunk = basic_config.chunk_size # Use config chunk size
 
-        assert mask1.shape == (B, MAX_MEM_SIZE)
-        assert mask1.dtype == torch.bool
-        assert mask1[:, :expected_writable1].all()
-        if expected_writable1 < MAX_MEM_SIZE:
-            assert not mask1[:, expected_writable1:].any()
+        results = []
+        # Simulate processing across a sequence, starting from 0 tokens processed
+        # We'll check the mask generated *for* each chunk within one simulated pass
+        tokens_processed_before_pass = 0 # Assume pass starts at beginning
 
-        # Test later chunk, high total processed (should hit max memory)
-        high_processed = basic_config.memory_cap_length
-        mask2 = manager.get_write_mask(
-            current_chunk_idx_in_pass=9, total_chunks_in_pass=10,
-            total_tokens_processed_before_chunk=high_processed,
-            batch_size=B, device=dev
-        )
-        seq_cap2 = manager.get_effective_size(high_processed) # Should be max_memory_size
-        chunk_prog_frac2 = basic_config.initial_write_fraction + (1.0 - basic_config.initial_write_fraction) * (10/10) # Should be 1.0
-        target_writable2 = int(MAX_MEM_SIZE * chunk_prog_frac2) # Should be max_memory_size
-        expected_writable2 = min(seq_cap2, target_writable2) # Should be max_memory_size
+        print(f"Config: max_mem={basic_config.max_memory_size}, cap_len={basic_config.memory_cap_length}, init_frac={basic_config.initial_write_fraction}, chunk_size={tokens_per_chunk}")
 
-        assert mask2.shape == (B, MAX_MEM_SIZE)
-        assert mask2.all() # Expect all True if cap and progress allow full write
+        for i in range(total_chunks_in_pass):
+            # Calculate total tokens processed *before* this specific chunk starts
+            tokens_before_chunk = tokens_processed_before_pass + (i * tokens_per_chunk)
+
+            # Calculate the sequence-length based write cap
+            seq_cap = manager.get_effective_size(tokens_before_chunk)
+
+            # Calculate the target writable size based on chunk progress within the pass
+            chunk_progress = (i + 1) / total_chunks_in_pass
+            write_fraction = basic_config.initial_write_fraction + (1.0 - basic_config.initial_write_fraction) * chunk_progress
+            target_size = int(basic_config.max_memory_size * write_fraction)
+
+            # The final expected writable size is the minimum of the two constraints
+            expected_writable = min(seq_cap, target_size)
+            expected_writable = max(0, expected_writable) # Ensure non-negative
+
+            # Get the actual mask from the function
+            mask = manager.get_write_mask(
+                current_chunk_idx_in_pass=i,
+                total_chunks_in_pass=total_chunks_in_pass,
+                total_tokens_processed_before_chunk=tokens_before_chunk,
+                batch_size=B,
+                device=dev
+            )
+            actual_writable = mask.sum().item()
+
+            print(f"  Chunk {i}: Tokens Before={tokens_before_chunk}, SeqCap={seq_cap}, Target={target_size} => Expected={expected_writable}, Actual={actual_writable}")
+
+            # Assert the calculated value matches the function's output
+            assert actual_writable == expected_writable, f"Chunk {i} Failed: Expected {expected_writable}, got {actual_writable}"
+            assert mask.shape == (B, basic_config.max_memory_size)
+            assert mask.dtype == torch.bool
+            # Verify mask content
+            assert mask[:, :expected_writable].all()
+            if expected_writable < basic_config.max_memory_size:
+                assert not mask[:, expected_writable:].any()
+
+            results.append(actual_writable)
+
+        # --- Check Progression ---
+        print(f"\n  Progression Results: {results}")
+        # Expect non-decreasing size (it might plateau if target_size grows faster than seq_cap or max is hit)
+        assert all(results[j] >= results[j - 1] for j in range(1, len(results))), "Expected non-decreasing writable size"
+        # Check if it actually increased at some point (unless cap=0 initially or max cap is reached early)
+        if len(results) > 1:
+             assert results[-1] > results[0] or (results[0] == 0) or (results[0] == basic_config.max_memory_size), \
+                 "Expected writable size to increase overall, start at 0, or be fully capped"
+
+        print("\nWrite mask progression test passed.")
 
     @pytest.mark.parametrize("is_persistent, rev_idx, win_size, expected_decay_approx", [
         (False, 0, 4, 1.0), # Lookahead, newest
@@ -1290,6 +1316,68 @@ class TestCMAModel:
         _ = basic_model([1, 2, 3], training_mode=False)
         assert len(basic_model.M_fwd) == basic_model.num_memory_groups
         assert len(basic_model.M_rev_persist) == basic_model.num_memory_groups
+
+    def test_forward_exact_chunk_size_cycle(self, basic_model, tokenizer):
+        """
+        Tests the model's state after processing exactly CHUNK_SIZE tokens,
+        verifying the re-chunking logic triggered by the cycle.
+        Based on cma_test_o3.py's chunk flush test.
+        """
+        basic_model.reset_state()
+        basic_model.eval()
+        dev = get_device()
+        basic_model.to(dev)
+
+        cfg = basic_model.config
+        input_tokens = list(range(cfg.chunk_size))  # Exactly chunk size
+
+        print(f"\nTesting cycle trigger with exact CHUNK_SIZE = {cfg.chunk_size}")
+        # Process the input, which should trigger the cycle and re-chunking
+        _ = basic_model(input_tokens, training_mode=False)
+
+        # Calculate expected sizes after reverse-with-gap re-chunking
+        gap_pct = cfg.semantic_chunking_gap_percentage / 100.0
+        expected_current_len = math.floor(cfg.chunk_size * (1 - gap_pct))
+        expected_current_len = max(1, expected_current_len)  # Ensure at least 1 token
+        expected_closed_len = cfg.chunk_size - expected_current_len
+
+        print(f"  Expected state after cycle:")
+        print(f"    - current_chunk_tokens length: {expected_current_len}")
+        print(f"    - closed_chunks count: {1 if expected_closed_len > 0 else 0}")
+        if expected_closed_len > 0:
+            print(f"    - closed_chunks[0] length: {expected_closed_len}")
+        print(f"    - total_tokens_processed: {cfg.chunk_size}")
+
+        print(f"  Actual state after cycle:")
+        print(f"    - current_chunk_tokens length: {len(basic_model.current_chunk_tokens)}")
+        print(f"    - closed_chunks count: {len(basic_model.closed_chunks)}")
+        if basic_model.closed_chunks:
+            print(f"    - closed_chunks[0] length: {len(basic_model.closed_chunks[0])}")
+        print(f"    - total_tokens_processed: {basic_model.total_tokens_processed}")
+
+        # Assert the state reflects the re-chunking
+        assert len(basic_model.current_chunk_tokens) == expected_current_len, \
+            f"Current chunk size mismatch. Expected {expected_current_len}, got {len(basic_model.current_chunk_tokens)}"
+
+        if expected_closed_len > 0:
+            assert len(basic_model.closed_chunks) == 1, \
+                f"Expected 1 closed chunk, got {len(basic_model.closed_chunks)}"
+            assert len(basic_model.closed_chunks[0]) == expected_closed_len, \
+                f"Closed chunk size mismatch. Expected {expected_closed_len}, got {len(basic_model.closed_chunks[0])}"
+            # Check content of closed chunk
+            assert basic_model.closed_chunks[0] == input_tokens[:expected_closed_len]
+        else:
+            # If gap is 0% or chunk_size is 1, there might be no closed chunk
+            assert len(basic_model.closed_chunks) == 0, \
+                f"Expected 0 closed chunks when remainder is 0, got {len(basic_model.closed_chunks)}"
+
+        # Check content of current chunk
+        assert basic_model.current_chunk_tokens == input_tokens[expected_closed_len:]
+
+        assert basic_model.total_tokens_processed == cfg.chunk_size, \
+            f"Total tokens processed mismatch. Expected {cfg.chunk_size}, got {basic_model.total_tokens_processed}"
+
+        print("Exact chunk size cycle test passed.")
 
 
 class TestUtilities:
