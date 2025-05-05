@@ -402,6 +402,104 @@ class TestChunkProcessor:
         assert len(short_chunks) == 1
         assert short_chunks[0] == short_tokens
 
+    def test_semantic_chunking_exact_size(self, processor, tokenizer):
+        # Create text likely to tokenize to exactly CHUNK_SIZE
+        # This is hard to guarantee, so aim for close and check behavior
+        avg_chars_per_token = 4  # Rough estimate
+        text = "word " * int(CHUNK_SIZE * avg_chars_per_token / 5)
+        tokens = tokenizer.encode(text)
+        # Adjust text length until tokens are close to CHUNK_SIZE
+        # (Simplified for test brevity - real scenario needs more robust generation)
+        if len(tokens) > CHUNK_SIZE:
+            text = tokenizer.decode(tokens[:CHUNK_SIZE])
+        elif len(tokens) < CHUNK_SIZE:
+            # Add padding that likely tokenizes simply
+            padding_tokens = tokenizer.encode("." * (CHUNK_SIZE - len(tokens)))
+            text += tokenizer.decode(padding_tokens[:CHUNK_SIZE - len(tokens)])
+
+        print(f"\nTesting semantic chunking with near CHUNK_SIZE text (target {CHUNK_SIZE})")
+        chunks = processor.semantic_chunk_reverse_with_gap(text)
+        token_counts = [len(c) for c in chunks]
+        print(f"  Resulting chunk sizes: {token_counts}")
+
+        assert len(chunks) >= 1
+        # If it resulted in one chunk, its size should be <= target_last_size
+        if len(chunks) == 1:
+            target_last = math.floor(CHUNK_SIZE * (1 - processor.config.semantic_chunking_gap_percentage / 100.0))
+            assert token_counts[0] <= target_last + processor.config.boundary_search_chars[
+                0]  # Allow boundary tolerance
+        # If multiple chunks, the last one follows gap rule, others <= CHUNK_SIZE
+        elif len(chunks) > 1:
+            target_last = math.floor(CHUNK_SIZE * (1 - processor.config.semantic_chunking_gap_percentage / 100.0))
+            assert all(tc <= CHUNK_SIZE for tc in token_counts[:-1])
+            assert token_counts[-1] <= target_last + processor.config.boundary_search_chars[
+                0]  # Allow boundary tolerance
+
+    def test_fixed_chunking_exact_size(self, processor):
+        CHUNK_SIZE = processor.config.chunk_size
+        GAP_PERCENT = processor.config.semantic_chunking_gap_percentage
+        tokens = list(range(CHUNK_SIZE))
+        print(f"\nTesting fixed_size_chunking with exact CHUNK_SIZE={CHUNK_SIZE}")
+
+        chunks = processor.fixed_size_chunk_reverse_with_gap(tokens)
+        token_counts = [len(c) for c in chunks]
+        print(f"  Resulting chunk sizes: {token_counts}")
+        # Expected: Applies gap to the "last" chunk segment, remainder becomes the first chunk.
+        target_last = math.floor(CHUNK_SIZE * (1 - GAP_PERCENT / 100.0))
+        target_last = max(1, target_last)
+        expected_first_chunk_size = CHUNK_SIZE - target_last
+        expected_sizes = []
+        if expected_first_chunk_size > 0:
+            expected_sizes.append(expected_first_chunk_size)
+        expected_sizes.append(target_last)
+
+        print(f"  Expected chunk sizes: {expected_sizes}")
+
+        assert len(chunks) == len(expected_sizes), f"Expected {len(expected_sizes)} chunks, got {len(chunks)}"
+        assert token_counts == expected_sizes, f"Chunk sizes mismatch. Got {token_counts}, expected {expected_sizes}"
+
+        # Check content reconstruction
+        reconstructed_tokens = [t for c in chunks for t in c]
+        assert reconstructed_tokens == tokens, "Token reconstruction failed"
+
+    def test_semantic_chunking_shorter_than_gap(self, processor, tokenizer):
+        target_last = math.floor(CHUNK_SIZE * (1 - processor.config.semantic_chunking_gap_percentage / 100.0))
+        target_len = target_last // 2  # Target token length
+        # Generate text aiming for target_len tokens
+        # Simple approach: use periods, assuming 1 token each
+        text = ". " * target_len
+        actual_tokens = tokenizer.encode(text)
+        # Adjust if needed (this might not be perfect but aims for the short case)
+        if len(actual_tokens) > target_len:
+            actual_tokens = actual_tokens[:target_len]
+            text = tokenizer.decode(actual_tokens)
+        elif len(actual_tokens) < target_len:
+            # Add more tokens if needed
+            text += ". " * (target_len - len(actual_tokens))
+            actual_tokens = tokenizer.encode(text)  # Re-encode final text
+
+        print(f"\nTesting semantic chunking shorter than gap-adjusted size (target_tokens {len(actual_tokens)})")
+        chunks = processor.semantic_chunk_reverse_with_gap(text)
+        token_counts = [len(c) for c in chunks]
+        print(f"  Resulting chunk sizes: {token_counts}")
+        # Expected: The early exit should trigger, returning a single chunk with all tokens.
+        assert len(chunks) == 1, f"Expected 1 chunk for short input, got {len(chunks)}"
+        assert token_counts[0] == len(actual_tokens), f"Expected chunk size {len(actual_tokens)}, got {token_counts[0]}"
+        assert chunks[0] == actual_tokens, "Chunk content mismatch"
+
+    def test_fixed_chunking_shorter_than_gap(self, processor):
+        target_last = math.floor(CHUNK_SIZE * (1 - processor.config.semantic_chunking_gap_percentage / 100.0))
+        target_len = target_last // 2
+        tokens = list(range(target_len))
+        print(f"\nTesting fixed_size_chunking shorter than gap-adjusted size (target_len {target_len})")
+        chunks = processor.fixed_size_chunk_reverse_with_gap(tokens)
+        token_counts = [len(c) for c in chunks]
+        print(f"  Resulting chunk sizes: {token_counts}")
+        # Should result in one chunk containing all tokens
+        assert len(chunks) == 1
+        assert token_counts[0] == target_len
+        assert chunks[0] == tokens
+
 
 class TestMemoryManager:
     @pytest.fixture(scope="class")
@@ -974,12 +1072,224 @@ class TestCMAModel:
         # Expected calls: floor(max_gen / freq) = floor(12 / 5) = 2
         assert call_log["count"] == 2
 
-    # TODO: Add test for semantic persistent update trigger if needed
-
     def test_set_training_step(self, basic_model):
         basic_model.set_training_step(500, 2000)
         assert basic_model.training_step == 500
         assert basic_model.total_training_steps == 2000
+
+    def test_model_instantiation_invalid_group(self, basic_config_dict, tokenizer):
+        # 1. Read-only layer without an update layer in its group
+        invalid_structure_1 = [
+            {"group": {"layers": ["local_only", "memory_read"], "repeat": 1}},  # No update layer
+            {"type": "local_only"},
+        ]
+        config_dict_1 = basic_config_dict.copy()
+        config_dict_1["layer_structure"] = invalid_structure_1
+        config_dict_1["n_layers"] = 3
+        with pytest.raises(ValueError, match=r"read-only layers require an update layer"):
+            CMAModel(CMAConfig.from_dict(config_dict_1), VOCAB_SIZE, tokenizer)
+
+        # 2. Multiple update layers in one group
+        invalid_structure_2 = [
+            {"group": {"layers": ["memory_update", "local_only", "memory_update"], "repeat": 1}},  # Two updates
+        ]
+        config_dict_2 = basic_config_dict.copy()
+        config_dict_2["layer_structure"] = invalid_structure_2
+        config_dict_2["n_layers"] = 3
+        with pytest.raises(ValueError, match=r">1 update layer"):
+            CMAModel(CMAConfig.from_dict(config_dict_2), VOCAB_SIZE, tokenizer)
+
+        # 3. Read-only layer assigned to group without update layer (more complex structure)
+        invalid_structure_3 = [
+            {"group": {"layers": ["local_only"], "repeat": 1}},  # Group 0 (no update)
+            {"group": {"layers": ["memory_update"], "repeat": 1}},  # Group 1 (update)
+            {"type": "memory_read"}  # Implicitly group 2, but MD spec requires explicit assignment?
+            # Current code assigns it to group 2, which lacks an update layer.
+            # Let's make it explicit for the test:
+            # {"group": {"layers": ["memory_read"], "group_id_for_read": 0}} # This needs config support
+            # Simpler test: Put read-only in its own group implicitly
+        ]
+        # Let's test the implicit assignment case which the current code hits:
+        config_dict_3 = basic_config_dict.copy()
+        config_dict_3["layer_structure"] = [
+            {"group": {"layers": ["local_only"], "repeat": 1}},  # Group 0
+            {"type": "memory_read"},  # Layer 1, implicitly Group 1
+            {"group": {"layers": ["memory_update"], "repeat": 1}},  # Layer 2, Group 2
+        ]
+        config_dict_3["n_layers"] = 3
+        # The check happens *after* parsing layers but before finishing init, matching the MD spec logic
+        with pytest.raises(ValueError, match=r"lacks update layer"):
+            CMAModel(CMAConfig.from_dict(config_dict_3), VOCAB_SIZE, tokenizer)
+
+    def test_cycle_with_single_resulting_chunk(self, basic_model, tokenizer):
+        basic_model.reset_state()
+        basic_model.eval()
+        dev = get_device()
+        basic_model.to(dev)
+
+        # Input slightly larger than chunk size, but might re-chunk into one chunk
+        # depending on semantic boundaries or fixed-size gap.
+        # Use fixed size for predictability here.
+        input_len = int(CHUNK_SIZE * 1.1)
+        input_tokens = list(range(input_len))
+
+        print(f"\nTesting cycle with input len {input_len} (expecting potentially 1 chunk post-rechunk)")
+        logits, loss = basic_model(input_tokens, training_mode=False)
+
+        print(f"  Resulting closed chunks: {len(basic_model.closed_chunks)}")
+        print(f"  Resulting current chunk len: {len(basic_model.current_chunk_tokens)}")
+        print(f"  Total tokens processed: {basic_model.total_tokens_processed}")
+
+        # Check if it resulted in one chunk
+        is_single_chunk = (len(basic_model.closed_chunks) == 0 and len(basic_model.current_chunk_tokens) > 0)
+
+        # Assert basic output validity regardless
+        assert logits.shape[0] == 1
+        assert logits.shape[1] == len(basic_model.current_chunk_tokens)
+        assert logits.shape[2] == VOCAB_SIZE
+        assert loss is None
+        assert basic_model.total_tokens_processed == input_len
+
+        if is_single_chunk:
+            print("  Scenario: Re-chunked into a single chunk.")
+            # Check M_rev_persist state. It should be close to initial state as Pass 3 had no input.
+            initial_rev_p = {}
+            for group_id, mem_idx in basic_model.group_id_to_memory_idx.items():
+                initial_rev_p[group_id] = basic_model.initial_rev_p_params[mem_idx].clone().detach().to(dev).repeat(1,
+                                                                                                                    1,
+                                                                                                                    1)
+
+            for group_id in basic_model.M_rev_persist:
+                assert torch.allclose(basic_model.M_rev_persist[group_id], initial_rev_p[group_id],
+                                      atol=1e-5), f"M_rev_persist for group {group_id} changed unexpectedly"
+        else:
+            print("  Scenario: Re-chunked into multiple chunks.")
+            # M_rev_persist should have changed (tested elsewhere)
+
+    def test_generate_prompt_triggers_cycle(self, basic_model, tokenizer):
+        basic_model.reset_state()
+        basic_model.eval()
+        dev = get_device()
+        basic_model.to(dev)
+
+        # Prompt long enough to trigger cycle immediately
+        prompt_len = CHUNK_SIZE + 10
+        prompt_tokens = list(range(prompt_len))
+        max_gen = 5
+
+        print(f"\nTesting generation where prompt triggers cycle (len {prompt_len})")
+        generated_ids = basic_model.generate(prompt=prompt_tokens, max_new_tokens=max_gen, reset_state=True)
+
+        print(f"  Generated {len(generated_ids)} tokens.")
+        print(f"  Final closed chunks: {len(basic_model.closed_chunks)}")
+        print(f"  Final current chunk len: {len(basic_model.current_chunk_tokens)}")
+        print(f"  Total tokens processed: {basic_model.total_tokens_processed}")
+
+        assert len(generated_ids) == max_gen
+        # Check state reflects the cycle having run *before* generation started
+        assert len(basic_model.closed_chunks) > 0  # Cycle ran on prompt
+        assert basic_model.total_tokens_processed == prompt_len  # Updated by cycle
+        # The current chunk should contain the last part of the prompt + generated tokens
+        expected_current_len = len(
+            basic_model.chunk_processor.fixed_size_chunk_reverse_with_gap(prompt_tokens)[-1]) + max_gen
+        assert len(basic_model.current_chunk_tokens) == expected_current_len
+
+    def test_generate_semantic_persist_update(self, basic_model, tokenizer):
+        basic_model.reset_state()
+        basic_model.eval()
+        dev = get_device()
+        basic_model.to(dev)
+
+        # Configure for semantic updates (e.g., on sentence end)
+        original_freq_tok = basic_model.config.persistent_reverse_update_freq_tokens
+        original_freq_sem = basic_model.config.persistent_reverse_update_freq_semantic
+        basic_model.config.persistent_reverse_update_freq_tokens = None  # Disable token-based
+        basic_model.config.persistent_reverse_update_freq_semantic = "secondary"  # e.g., sentence_end
+        max_gen = 20
+        prompt = "This is the start"  # No sentence end yet
+
+        # Mock the persistent reverse pass to check if it's called
+        call_log = {"count": 0}
+        original_persist_pass = basic_model._run_persistent_reverse_pass
+
+        def mocked_persist_pass(*args, **kwargs):
+            print("  DEBUG: Persistent reverse pass called!")
+            call_log["count"] += 1
+            # Check that the history passed makes sense (optional)
+            passed_chunks = args[0]
+            print(f"    Passed {len(passed_chunks)} chunks for update.")
+            return original_persist_pass(*args, **kwargs)
+
+        basic_model._run_persistent_reverse_pass = mocked_persist_pass
+
+        # Force generation of a sentence-ending punctuation
+        original_forward = basic_model.forward
+        force_period_next = False
+        period_id = tokenizer.encode(".")[0]
+
+        def mocked_forward(*args, **kwargs):
+            nonlocal force_period_next
+            logits, loss = original_forward(*args, **kwargs)
+            # After generating a few tokens, force a period
+            if not kwargs.get('training_mode', False) and logits.numel() > 0 and len(
+                    basic_model.current_chunk_tokens) > len(tokenizer.encode(prompt)) + 5:
+                force_period_next = True
+
+            if force_period_next and not kwargs.get('training_mode', False) and logits.numel() > 0:
+                print("  DEBUG: Forcing period token.")
+                logits[0, -1, :] = -100.0  # Suppress others
+                logits[0, -1, period_id] = 10.0  # Boost period
+                force_period_next = False  # Reset flag
+
+            return logits, loss
+
+        basic_model.forward = mocked_forward
+
+        print(f"\nTesting semantic persistent update trigger (target: '.')")
+        _ = basic_model.generate(prompt=prompt, max_new_tokens=max_gen, reset_state=True)
+
+        basic_model.forward = original_forward  # Restore
+        basic_model._run_persistent_reverse_pass = original_persist_pass  # Restore
+        basic_model.config.persistent_reverse_update_freq_tokens = original_freq_tok  # Restore config
+        basic_model.config.persistent_reverse_update_freq_semantic = original_freq_sem  # Restore config
+
+        # Should be called at least once after the period is generated
+        assert call_log["count"] >= 1
+
+    def test_reset_state_clears_correctly(self, basic_model, tokenizer):
+        basic_model.reset_state()  # Start clean
+        basic_model.eval()
+        dev = get_device()
+        basic_model.to(dev)
+
+        # Process some data to populate state
+        input_tokens = list(range(CHUNK_SIZE + 10))
+        _ = basic_model(input_tokens, training_mode=False)
+
+        # Check state is populated
+        assert len(basic_model.closed_chunks) > 0
+        assert len(basic_model.current_chunk_tokens) > 0
+        assert basic_model.total_tokens_processed > 0
+        assert len(basic_model.M_fwd) > 0
+        assert len(basic_model.M_rev_persist) > 0
+
+        # Reset the state
+        basic_model.reset_state()
+
+        # Check state is cleared
+        assert len(basic_model.closed_chunks) == 0
+        assert len(basic_model.current_chunk_tokens) == 0
+        assert basic_model.current_chunk_text == ""
+        assert basic_model.total_tokens_processed == 0
+        assert basic_model.tokens_since_persistent_update == 0
+        assert len(basic_model.M_fwd) == 0  # Dictionaries are cleared
+        assert len(basic_model.M_rev_ahead) == 0
+        assert len(basic_model.M_rev_persist) == 0
+
+        # Check that next forward call re-initializes memory
+        _ = basic_model([1, 2, 3], training_mode=False)
+        assert len(basic_model.M_fwd) == basic_model.num_memory_groups
+        assert len(basic_model.M_rev_persist) == basic_model.num_memory_groups
 
 
 class TestUtilities:
@@ -1192,5 +1502,88 @@ def test_forward_cycle_no_reset(basic_config_dict, tokenizer):
         if model.closed_chunks: # Ensure there was history for persist pass
              assert not torch.allclose(model.M_rev_persist[group_id], m_rev_p_after_1[group_id])
 
+class TestTrainingSpecifics:
+
+    def test_gate_regularization_types(self, basic_config_dict, tokenizer):
+        dev = get_device()
+        input_tokens = list(range(CHUNK_SIZE + 10)) # Trigger cycle
+
+        # Test L1 (already in basic_config)
+        config_l1 = CMAConfig.from_dict(basic_config_dict)
+        config_l1.gate_regularization_type = "l1"
+        model_l1 = CMAModel(config_l1, VOCAB_SIZE, tokenizer).to(dev)
+        model_l1.train()
+        _, loss_l1 = model_l1(input_tokens, training_mode=True)
+        assert loss_l1 is not None and loss_l1.item() >= 0
+
+        # Test Entropy
+        config_ent = CMAConfig.from_dict(basic_config_dict)
+        config_ent.gate_regularization_type = "entropy"
+        model_ent = CMAModel(config_ent, VOCAB_SIZE, tokenizer).to(dev)
+        model_ent.train()
+        _, loss_ent = model_ent(input_tokens, training_mode=True)
+        assert loss_ent is not None and loss_ent.item() >= 0
+
+        # Test None
+        config_none = CMAConfig.from_dict(basic_config_dict)
+        config_none.gate_regularization_type = None
+        model_none = CMAModel(config_none, VOCAB_SIZE, tokenizer).to(dev)
+        model_none.train()
+        _, loss_none = model_none(input_tokens, training_mode=True)
+        # If type is None, the forward pass should return None for the loss component
+        assert loss_none is None
+
+    def test_mask_future_dropout_extremes(self, basic_config_dict, tokenizer):
+        dev = get_device()
+        input_tokens = list(range(CHUNK_SIZE + 10)) # Trigger cycle
+
+        # Test p_drop = 0 (masking disabled effectively)
+        config_p0 = CMAConfig.from_dict(basic_config_dict)
+        config_p0.mask_future_rates = [0.0, 0.0, 0.0] # Force p_drop = 0
+        model_p0 = CMAModel(config_p0, VOCAB_SIZE, tokenizer).to(dev)
+        model_p0.train()
+        model_p0.set_training_step(500, 1000) # Step doesn't matter if rates are 0
+        # Need to check internal state - mock _mask_persistent_memory
+        original_mask_method = model_p0._mask_persistent_memory
+        mask_call_log_p0 = {'called': False}
+        def mocked_mask_p0(memory_dict, p_drop):
+            mask_call_log_p0['called'] = True
+            assert p_drop == 0.0
+            # Should return original dict if p_drop is 0
+            return memory_dict
+        model_p0._mask_persistent_memory = mocked_mask_p0
+        _ = model_p0(input_tokens, training_mode=True)
+        model_p0._mask_persistent_memory = original_mask_method # Restore
+        assert mask_call_log_p0['called'] # Ensure method was reached
+        # No easy way to assert memory wasn't masked without more mocking, rely on p_drop check
+
+
+        # Test p_drop = 1 (all persistent memory masked)
+        config_p1 = CMAConfig.from_dict(basic_config_dict)
+        config_p1.mask_future_rates = [1.0, 1.0, 1.0] # Force p_drop = 1
+        model_p1 = CMAModel(config_p1, VOCAB_SIZE, tokenizer).to(dev)
+        model_p1.train()
+        model_p1.set_training_step(500, 1000)
+        # Mock mask method again
+        original_mask_method_p1 = model_p1._mask_persistent_memory
+        mask_call_log_p1 = {'called': False, 'all_zero': False}
+        def mocked_mask_p1(memory_dict, p_drop):
+            mask_call_log_p1['called'] = True
+            assert p_drop == 1.0
+            masked_dict = original_mask_method_p1(memory_dict, p_drop)
+            # Check if all tensors in the masked dict are zero
+            all_zero = True
+            for k, v in masked_dict.items():
+                 if v is not None and v.numel() > 0:
+                      if not torch.all(v == 0):
+                           all_zero = False
+                           break
+            mask_call_log_p1['all_zero'] = all_zero
+            return masked_dict
+        model_p1._mask_persistent_memory = mocked_mask_p1
+        _ = model_p1(input_tokens, training_mode=True)
+        model_p1._mask_persistent_memory = original_mask_method_p1 # Restore
+        assert mask_call_log_p1['called']
+        assert mask_call_log_p1['all_zero'] # Ensure memory was zeroed out
 
 print("\nCMA.md Conformance Checklist appears well-covered by tests.")

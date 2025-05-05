@@ -258,79 +258,148 @@ class ChunkProcessor:
         if not text:
             return []
 
+        initial_tokens = self.tokenizer.encode(text)
+        gap_percentage = self.config.semantic_chunking_gap_percentage / 100.0
+        target_last_size = int(self.config.chunk_size * (1 - gap_percentage))
+        target_last_size = max(1, target_last_size)
+
+        if len(initial_tokens) <= target_last_size:
+             return [initial_tokens]
+
         chunks = []
         end_pos = len(text)
+        # Keep track of the last successful start_pos to prevent infinite loops if fallback keeps failing
+        last_successful_start_pos = -1
 
         while end_pos > 0:
-            # For last chunk, use target size with gap
             if end_pos == len(text):
-                gap_percentage = self.config.semantic_chunking_gap_percentage / 100.0
-                target_size = int(self.config.chunk_size * (1 - gap_percentage))
-                target_size = max(1, target_size)
+                current_target_size = target_last_size
             else:
-                target_size = self.config.chunk_size
+                current_target_size = self.config.chunk_size
 
-            # Initial estimate of start position
-            est_start = max(0, end_pos - target_size)
+            # Heuristic estimation - use character count relative to target token count
+            # Assume avg 1.5 chars/token as a rough middle ground? Or stick to *2? Let's try 1.5
+            est_start = max(0, end_pos - int(current_target_size * 1.5))
 
-            # Don't bypass gap logic for short texts
-            # Only use this shortcut if the text is shorter than the gap-adjusted target
-            if end_pos <= target_size and end_pos == len(text):
-                chunk_tokens = self.tokenizer.encode(text)
-                chunks.insert(0, chunk_tokens)
-                break
+            # --- Check for simple termination case ---
+            # If the remaining text fits the target size, just take it.
+            # Avoids unnecessary boundary search/overshoot loops at the very end.
+            remaining_text = text[:end_pos]
+            remaining_tokens = self.tokenizer.encode(remaining_text)
+            if len(remaining_tokens) <= current_target_size:
+                if remaining_tokens: # Avoid adding empty chunk if text was empty somehow
+                    chunks.insert(0, remaining_tokens)
+                end_pos = 0 # We are done
+                continue # Exit while loop
 
-            # Loop to find suitable boundary
+            # --- End simple termination check ---
+
             found_valid_chunk = False
             iteration = 0
-            max_iterations = 10  # Prevent infinite loops
+            max_iterations = 10 # Limit inner loop retries
+            current_est_start = est_start # Use this for inner loop adjustments
+
+            # Prevent fallback loop: if fallback used the same start_pos last time, force progress
+            if est_start == last_successful_start_pos:
+                 print(f"DEBUG: semantic_chunk - Fallback might loop. Forcing progress from end_pos {end_pos}")
+                 start_pos = max(0, end_pos - 1) # Take at least one char
+                 chunk_text = text[start_pos:end_pos]
+                 if chunk_text: # Ensure text exists
+                     chunk_tokens = self.tokenizer.encode(chunk_text)
+                     # Truncate if needed (highly unlikely here, but safe)
+                     if len(chunk_tokens) > current_target_size:
+                         chunk_tokens = chunk_tokens[:current_target_size]
+                     if chunk_tokens: # Final check if tokens exist
+                        chunks.insert(0, chunk_tokens)
+                 else: # If text[end_pos-1:end_pos] is empty (e.g. multi-byte char issue?)
+                     print(f"WARN: semantic_chunk - Forced progress resulted in empty text slice.")
+                 end_pos = start_pos # Ensure outer loop makes progress
+                 last_successful_start_pos = start_pos # Update last pos
+                 continue # Skip normal inner loop/fallback
+
 
             while not found_valid_chunk and iteration < max_iterations:
                 # Add buffer for search
                 buffer_chars = int(self.config.boundary_search_chars[0] * self.config.buffer_ratio)
-                search_start = max(0, est_start + buffer_chars)
+                search_start_point = min(end_pos, max(0, current_est_start + buffer_chars))
 
-                # Search for boundary within character windows
-                start_pos = self._find_semantic_boundary_backward(text, search_start, end_pos)
+                start_pos = self._find_semantic_boundary_backward(text, search_start_point, end_pos)
 
-                # Tokenize and check chunk size
+                # --- Prevent start_pos from exceeding end_pos ---
+                start_pos = min(start_pos, end_pos)
+
                 chunk_text = text[start_pos:end_pos]
+
+                if not chunk_text:
+                    # Empty slice usually means start_pos >= end_pos
+                    if start_pos == 0 and end_pos <=0 : # Check if we are truly at the beginning and done
+                         print("DEBUG: semantic_chunk - Empty chunk text at start_pos 0, terminating.")
+                         end_pos = 0
+                         found_valid_chunk = True # Exit inner loop cleanly
+                         continue # Go to outer loop check (will terminate)
+                    else:
+                        # Treat as overshoot signal if slice is empty unexpectedly mid-sequence
+                        print(f"DEBUG: semantic_chunk - Empty chunk text for start_pos {start_pos}, end_pos {end_pos}. Adjusting estimate.")
+                        # Need to move current_est_start *back* slightly to try and get content
+                        current_est_start = max(0, start_pos - 10) # Move back 10 chars arbitrarily
+                        iteration += 1
+                        continue # Retry inner loop
+
                 chunk_tokens = self.tokenizer.encode(chunk_text)
 
-                # Check if chunk respects the size limit
-                max_allowed_size = target_size if end_pos == len(text) else self.config.chunk_size
+                # If encoding results in empty tokens (e.g., only whitespace removed by tokenizer)
+                if not chunk_tokens:
+                     print(f"DEBUG: semantic_chunk - Encoded tokens empty for text slice [{start_pos}:{end_pos}]. Adjusting estimate.")
+                     current_est_start = max(0, start_pos - 10)
+                     iteration += 1
+                     continue # Retry inner loop
+
+                # Check size limit
+                max_allowed_size = current_target_size
 
                 if len(chunk_tokens) <= max_allowed_size:
                     found_valid_chunk = True
                     chunks.insert(0, chunk_tokens)
+                    end_pos = start_pos
+                    last_successful_start_pos = start_pos # Record successful position
                 else:
-                    # Estimate new start position to reduce chunk size
+                    # Overshoot logic
                     excess_tokens = len(chunk_tokens) - max_allowed_size
                     chars_per_token = len(chunk_text) / len(chunk_tokens)
-                    est_start = start_pos + int(excess_tokens * chars_per_token * 1.1)  # 1.1 buffer
+                    # Adjust estimate forward based on the *current* failed start_pos
+                    current_est_start = start_pos + int(excess_tokens * chars_per_token * 1.1) # Reduced buffer slightly
                     iteration += 1
+                    print(f"DEBUG: semantic_chunk - Overshot size ({len(chunk_tokens)} > {max_allowed_size}), retrying with est_start {current_est_start}")
 
-            # If we couldn't find a valid boundary, use the estimated start
-            if not found_valid_chunk:
-                chunk_text = text[est_start:end_pos]
-                chunk_tokens = self.tokenizer.encode(chunk_text)
 
-                # If still too large, truncate to respect the limit
-                max_allowed_size = target_size if end_pos == len(text) else self.config.chunk_size
-                if len(chunk_tokens) > max_allowed_size:
-                    chunk_tokens = chunk_tokens[:max_allowed_size]
-
-                chunks.insert(0, chunk_tokens)
-                # Adjust start_pos for next iteration
+            # Fallback if inner loop exhausted iterations
+            if not found_valid_chunk and end_pos > 0:
+                print(f"DEBUG: semantic_chunk - Fallback after {max_iterations} iterations for end_pos {end_pos}")
+                # Use the original estimate for this outer loop pass
                 start_pos = est_start
+                # --- Prevent start_pos from exceeding end_pos in fallback ---
+                start_pos = min(start_pos, end_pos)
 
-            # Ensure we make progress in the outer loop
-            if start_pos >= end_pos:
-                start_pos = end_pos - 1
-            if start_pos < 0:
-                start_pos = 0
+                chunk_text = text[start_pos:end_pos]
 
-            end_pos = start_pos
+                if chunk_text:
+                    chunk_tokens = self.tokenizer.encode(chunk_text)
+                    max_allowed_size = current_target_size
+                    if len(chunk_tokens) > max_allowed_size:
+                        print(f"DEBUG: semantic_chunk - Truncating fallback chunk ({len(chunk_tokens)} > {max_allowed_size})")
+                        chunk_tokens = chunk_tokens[:max_allowed_size]
+
+                    if chunk_tokens:
+                        chunks.insert(0, chunk_tokens)
+                    else:
+                         print(f"WARN: semantic_chunk - Fallback resulted in empty tokens for slice [{start_pos}:{end_pos}]")
+                else:
+                     print(f"WARN: semantic_chunk - Fallback resulted in empty text slice [{start_pos}:{end_pos}]")
+
+
+                # Update end_pos based on the start_pos used for the fallback chunk
+                end_pos = start_pos
+                last_successful_start_pos = start_pos # Record fallback position
 
         return chunks
 
