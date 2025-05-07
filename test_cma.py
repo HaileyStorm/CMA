@@ -5,21 +5,20 @@ import tiktoken
 import yaml
 import math
 from typing import Dict, Any
-
-# Assuming cma.py is in the same directory or accessible via PYTHONPATH
-from cma import (
-    CMAConfig,
-    LayerGroup,
-    ControlTokenGenerator,
-    ChunkProcessor,
-    MemoryManager,
+from cma_model import (
     CausalSelfAttention,
     CascadeMemoryAttention,
     Block,
     CMAModel,
+)
+from cma_components import (
+    CMAConfig,
+ControlTokenGenerator,
+    ChunkProcessor,
+    MemoryManager,
     norm,
     get_mask_future_schedule,
-    BOUNDARY_PATTERNS # Import for semantic chunking tests if needed
+    BOUNDARY_PATTERNS
 )
 
 # --- Constants and Fixtures ---
