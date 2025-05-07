@@ -496,6 +496,99 @@ class TestChunkProcessor:
         assert token_counts[0] == target_len
         assert chunks[0] == tokens
 
+    def test_semantic_chunking_boundary_priority(self, processor, tokenizer):
+        original_chunk_size = processor.config.chunk_size  # Store original
+
+        # --- Scenario 1: Primary preferred over secondary/tertiary ---
+        print(f"\nDEBUG Boundary Priority Test 1 (Primary):")
+        # Construct text with clear boundaries before the primary one
+        part1 = "This is clause 1, and sentence 1. This is clause 2, and sentence 2."
+        primary_boundary = "\n\n# Section Break\n\n"
+        part2 = "This is content after the section break, it needs to be long enough. " * 10
+        text1 = part1 + primary_boundary + part2
+
+        tokens_part1 = tokenizer.encode(part1)
+
+        # Set chunk_size to be slightly larger than part1 to force the decision
+        processor.config.chunk_size = len(tokens_part1) + 15  # Adjust offset if needed
+        print(f"  Temporarily setting chunk_size to: {processor.config.chunk_size}")
+
+        chunks1 = processor.semantic_chunk_reverse_with_gap(text1)
+        processor.config.chunk_size = original_chunk_size  # Restore
+
+        # Print resulting chunks for debugging
+        for i, c in enumerate(chunks1):
+            print(f"  Chunk {i} (len {len(c)}): '{tokenizer.decode(c)}'")
+
+        # Assertions for Scenario 1
+        assert len(chunks1) > 1, "Test 1 requires text to be split into multiple chunks"
+
+        # Check that chunk[0] contains part1 AND the primary boundary
+        decoded_chunk0_s1 = tokenizer.decode(chunks1[0]).strip()  # Use strip() for cleaner comparison
+        # Construct the expected content including the boundary
+        expected_chunk0_s1 = (part1 + primary_boundary).strip()
+
+        assert decoded_chunk0_s1 == expected_chunk0_s1, \
+            f"Chunk 0 should contain text before AND the primary boundary.\nExpected: '{expected_chunk0_s1}'\nGot:      '{decoded_chunk0_s1}'"
+
+        # Check that chunk[1] starts after the primary boundary (this assertion should still be correct)
+        expected_start_chunk1_s1 = part2.lstrip()
+        decoded_chunk1_s1 = tokenizer.decode(chunks1[1]).lstrip()
+        assert decoded_chunk1_s1.startswith(expected_start_chunk1_s1[:20]), \
+            f"Chunk 1 (s1) should start after the primary boundary. Expected start: '{expected_start_chunk1_s1[:20]}', Got: '{decoded_chunk1_s1[:20]}'"
+
+        print("Boundary Priority Test 1 passed.")
+
+        # --- Scenario 2: Secondary preferred over tertiary ---
+        # (Keep the Scenario 2 code as provided in the previous response, it should be correct)
+        print(f"\nDEBUG Boundary Priority Test 2 (Secondary vs Tertiary):")
+        # Text where secondary ('.') appears after tertiary (',')
+        text2 = "Clause one, clause two. Clause three needs to be long enough to ensure split maybe." * 3
+        first_period_idx = text2.find('.')
+        assert first_period_idx != -1, "Test text must contain a period."
+        text_up_to_period = text2[:first_period_idx + 1]
+        tokens_up_to_period = tokenizer.encode(text_up_to_period)
+        processor.config.chunk_size = len(tokens_up_to_period) + 5
+        print(f"  Temporarily setting chunk_size to: {processor.config.chunk_size}")
+        chunks2 = processor.semantic_chunk_reverse_with_gap(text2)
+        processor.config.chunk_size = original_chunk_size
+        for i, c in enumerate(chunks2):
+            print(f"  Chunk {i} (len {len(c)}): '{tokenizer.decode(c)}'")
+        assert len(chunks2) > 1, "Test 2 requires text to be split into multiple chunks"
+        decoded_chunk0_s2 = tokenizer.decode(chunks2[0]).rstrip()
+        print(f"  Decoded Chunk 0 (stripped): '{decoded_chunk0_s2}'")
+        assert decoded_chunk0_s2.endswith("."), "Chunk 0 should end with the sentence boundary (.)"
+        assert not decoded_chunk0_s2.endswith(","), "Chunk 0 should not end just with the clause boundary (,)"
+        expected_start_chunk1_s2 = text2[first_period_idx + 1:].lstrip()
+        decoded_chunk1_s2 = tokenizer.decode(chunks2[1]).lstrip()
+        print(f"  Decoded Chunk 1 (stripped): '{decoded_chunk1_s2[:30]}...'")
+        print(f"  Expected Chunk 1 Start: '{expected_start_chunk1_s2[:30]}...'")
+        assert decoded_chunk1_s2.startswith(expected_start_chunk1_s2[:20]), \
+            f"Chunk 1 (s2) should start after the period. Expected start: '{expected_start_chunk1_s2[:20]}', Got: '{decoded_chunk1_s2[:20]}'"
+        print("Boundary Priority Test 2 passed.")
+
+        # --- Scenario 3 (Optional but good): Test text3 logic from original ---
+        # This verifies secondary preference again with a slightly different structure
+        print(f"\nDEBUG Boundary Priority Test 3 (Secondary vs Tertiary - Alt Text):")
+        text3 = "Clause one, clause two. Clause three"
+        tokens_up_to_period_t3 = tokenizer.encode("Clause one, clause two.")
+        processor.config.chunk_size = len(tokens_up_to_period_t3) + 2  # Force split near period
+        print(f"  Temporarily setting chunk_size to: {processor.config.chunk_size}")
+        chunks3 = processor.semantic_chunk_reverse_with_gap(text3)
+        processor.config.chunk_size = original_chunk_size  # Restore
+
+        for i, c in enumerate(chunks3):
+            print(f"  Chunk {i} (len {len(c)}): '{tokenizer.decode(c)}'")
+
+        assert len(chunks3) > 1, "Test 3 requires text to be split into multiple chunks"
+        decoded_chunk0_t3 = tokenizer.decode(chunks3[0]).rstrip()
+        assert decoded_chunk0_t3.endswith("."), "Chunk 0 (t3) should end with the sentence boundary (.)"
+        assert not decoded_chunk0_t3.endswith(","), "Chunk 0 (t3) should not end with the clause boundary (,)"
+        expected_start_chunk1_t3 = text3.split(". ")[1].lstrip()
+        decoded_chunk1_t3 = tokenizer.decode(chunks3[1]).lstrip()
+        assert decoded_chunk1_t3.startswith(expected_start_chunk1_t3[:10]), \
+            f"Chunk 1 (t3) should start after the period. Expected start: '{expected_start_chunk1_t3[:10]}', Got: '{decoded_chunk1_t3[:10]}'"
+        print("Boundary Priority Test 3 passed.")
 
 class TestMemoryManager:
     @pytest.fixture(scope="class")
@@ -978,21 +1071,37 @@ class TestCMAModel:
 
     def test_forward_training_mode(self, basic_model, tokenizer):
         basic_model.reset_state()
-        basic_model.train() # Set to training mode
+        basic_model.train()  # Set to training mode
         dev = get_device()
         basic_model.to(dev)
-        basic_model.set_training_step(100, 1000) # For mask-future
+        basic_model.set_training_step(100, 1000)  # For mask-future
 
-        input_tokens = list(range(CHUNK_SIZE + 10)) # Trigger cycle
+        input_token_list = list(range(CHUNK_SIZE + 10))  # Trigger cycle, length 138
+        original_input_len = len(input_token_list)
 
         # Store initial M_rev_persist state before forward pass
-        basic_model._initialize_memory_states(force_reset=True) # Ensure clean start
-        initial_rev_p_copy = {k: v.clone() for k, v in basic_model.M_rev_persist.items()}
+        basic_model._initialize_memory_states(force_reset=True)  # Ensure clean start
+        # initial_rev_p_copy = {k: v.clone() for k, v in basic_model.M_rev_persist.items()} # Not directly used in asserts here
 
-        logits, loss = basic_model(input_tokens, training_mode=True) # Pass training_mode=True
+        logits, loss = basic_model(input_token_list, training_mode=True)
 
         assert logits.shape[0] == 1
-        assert logits.shape[1] == len(basic_model.current_chunk_tokens)
+
+        # NEW ASSERTION LOGIC:
+        # In training mode, if a cycle is triggered (as it is here),
+        # logits are concatenated from all chunks of Pass 2.
+        # The total length of these logits should correspond to the total number of tokens
+        # that were re-chunked and processed in Pass 2.
+        # For this input, all original_input_len tokens are processed.
+        # Note: This assumes no tokens are dropped or added by the chunking/processing itself,
+        # which is generally true for standard tokenization.
+        # The number of tokens for which predictions are made is logits.shape[1].
+        # The original input sequence had `original_input_len` tokens.
+        # The CMAModel.forward was called with these `original_input_len` tokens.
+        # The Pass 2 processes all these tokens.
+        assert logits.shape[1] == original_input_len, \
+            f"Logits length {logits.shape[1]} should match original input length {original_input_len} in training cycle"
+
         assert logits.shape[2] == VOCAB_SIZE
 
         # Check loss is returned and is a scalar tensor
@@ -1000,17 +1109,18 @@ class TestCMAModel:
         assert isinstance(loss, torch.Tensor)
         assert loss.ndim == 0
         # Loss should be positive (or zero) if regularization is applied
-        assert loss.item() >= 0
+        # (or if predictions are not perfect, which is expected)
+        # A strict loss.item() > 0 might be too fragile if by chance all predictions are perfect
+        # or if regularization strength is zero and there's no pred loss.
+        # loss.item() >= 0 is safer.
+        assert loss.item() >= 0  # Gate reg is L1, so >= 0. Pred loss also >= 0.
 
-        # Check if mask-future was likely applied (M_rev_persist used in forward pass should differ from initial)
-        # This is hard to check directly without instrumenting the forward pass.
-        # We can indirectly verify by checking if M_rev_persist itself changed after the cycle
-        # (as done in test_forward_trigger_cycle) and trust that the masking logic inside _run_forward_pass works.
-        # Also check that the schedule function gives non-zero dropout
-        p_drop = get_mask_future_schedule(basic_model.config, basic_model.training_step, basic_model.total_training_steps)
-        assert p_drop > 0 # Should be > 0 given the schedule and step
+        # Check if mask-future was likely applied
+        p_drop = get_mask_future_schedule(basic_model.config, basic_model.training_step,
+                                          basic_model.total_training_steps)
+        assert p_drop > 0
 
-        basic_model.eval() # Reset to eval mode
+        basic_model.eval()  # Reset to eval mode
 
     def test_generate_with_prompt(self, basic_model, tokenizer):
         basic_model.reset_state()
@@ -1377,6 +1487,141 @@ class TestCMAModel:
             f"Total tokens processed mismatch. Expected {cfg.chunk_size}, got {basic_model.total_tokens_processed}"
 
         print("Exact chunk size cycle test passed.")
+
+    def test_forward_pre_chunked_training_and_eval(self, basic_model: CMAModel):
+        dev = get_device()
+        basic_model.to(dev)
+
+        safe_token_id = min(10, VOCAB_SIZE - 1)
+        chunk1 = [safe_token_id] * 50
+        chunk2 = [safe_token_id] * 70
+        pre_chunked_input = [chunk1, chunk2]
+        total_input_len = len(chunk1) + len(chunk2)
+
+        # Scenario 1: Evaluation mode
+        basic_model.reset_state()
+        basic_model.eval()
+        logits_eval, loss_eval = basic_model(pre_chunked_input, training_mode=False)
+
+        assert logits_eval.shape[0] == 1
+        assert logits_eval.shape[1] == len(chunk2)  # Logits for the last chunk
+        assert logits_eval.shape[2] == VOCAB_SIZE
+        assert loss_eval is None
+        assert basic_model.closed_chunks == [chunk1]
+        assert basic_model.current_chunk_tokens == chunk2
+        assert basic_model.total_tokens_processed == total_input_len
+
+        # Scenario 2: Training mode
+        basic_model.reset_state()
+        basic_model.train()
+        basic_model.set_training_step(100, 1000)  # For mask-future
+
+        logits_train, loss_train = basic_model(pre_chunked_input, training_mode=True)
+
+        assert logits_train.shape[0] == 1
+        # In training mode with pre-chunked input, a cycle is triggered.
+        # Logits should be concatenated from Pass 2 processing of all input chunks.
+        assert logits_train.shape[1] == total_input_len
+        assert logits_train.shape[2] == VOCAB_SIZE
+        assert loss_train is not None
+        assert loss_train.ndim == 0
+        assert loss_train.item() >= 0
+        # State after cycle with pre-defined chunks
+        assert basic_model.closed_chunks == [chunk1]  # Input chunks are used directly
+        assert basic_model.current_chunk_tokens == chunk2
+        assert basic_model.total_tokens_processed == total_input_len
+
+        basic_model.eval()  # Reset
+
+    def test_memory_shapes_through_cycle(self, basic_model, tokenizer):
+        basic_model.reset_state()
+        basic_model.eval()
+        dev = get_device()
+        basic_model.to(dev)
+
+        input_tokens = list(range(CHUNK_SIZE + 10))
+
+        # 1. Before cycle (after _initialize_memory_states)
+        basic_model._initialize_memory_states(force_reset=True)
+        for group_id in basic_model.group_id_to_memory_idx.keys():
+            assert basic_model.M_fwd[group_id].shape == (1, MAX_MEM_SIZE, EMBED_DIM)
+            # M_rev_ahead is initialized as placeholder, check after Pass 1
+            assert basic_model.M_rev_persist[group_id].shape == (1, REV_MEM_SIZE, EMBED_DIM)
+
+        # Mock _run_lookahead_reverse_pass to inspect M_rev_ahead
+        original_run_lookahead = basic_model._run_lookahead_reverse_pass
+        m_rev_ahead_seen = {}
+
+        def mocked_run_lookahead(*args, **kwargs):
+            nonlocal m_rev_ahead_seen
+            # Call original to compute it
+            computed_m_rev_ahead = original_run_lookahead(*args, **kwargs)
+            m_rev_ahead_seen = {k: v.clone() for k, v in computed_m_rev_ahead.items()}
+            return computed_m_rev_ahead
+
+        basic_model._run_lookahead_reverse_pass = mocked_run_lookahead
+
+        _ = basic_model(input_tokens, training_mode=False)  # Trigger cycle
+        basic_model._run_lookahead_reverse_pass = original_run_lookahead  # Restore
+
+        # 2. Check M_rev_ahead shape (captured during its computation)
+        assert len(m_rev_ahead_seen) == basic_model.num_memory_groups
+        for group_id in m_rev_ahead_seen:
+            assert m_rev_ahead_seen[group_id].shape == (1, REV_MEM_SIZE, EMBED_DIM)
+
+        # 3. After full cycle
+        for group_id in basic_model.group_id_to_memory_idx.keys():
+            assert basic_model.M_fwd[group_id].shape == (1, MAX_MEM_SIZE, EMBED_DIM)
+            assert not basic_model.M_rev_ahead  # Should be cleared after Pass 2
+            assert basic_model.M_rev_persist[group_id].shape == (1, REV_MEM_SIZE, EMBED_DIM)
+
+    def test_forward_training_mode_no_cycle(self, basic_model, tokenizer):
+        """Tests forward pass in training mode WITHOUT triggering a memory cycle."""
+        basic_model.reset_state()
+        basic_model.train()  # Set to training mode
+        dev = get_device()
+        basic_model.to(dev)
+        basic_model.set_training_step(100, 1000)  # Set step for consistency
+
+        # Input shorter than chunk size, should not trigger a cycle
+        input_len = CHUNK_SIZE // 2
+        input_tokens = list(range(input_len))
+
+        # Store initial memory state if needed for comparison (optional)
+        basic_model._initialize_memory_states(force_reset=True)
+        initial_fwd_mem_copy = {k: v.clone() for k, v in basic_model.M_fwd.items()}
+
+        logits, loss = basic_model(input_tokens, training_mode=True)
+
+        # --- Assertions ---
+        assert logits.shape[0] == 1
+
+        # 1. Logits length should match the input length (and current_chunk_tokens)
+        assert logits.shape[1] == input_len, \
+            f"Logits length {logits.shape[1]} should match input length {input_len} when no cycle occurs"
+        assert len(basic_model.current_chunk_tokens) == input_len, \
+            f"current_chunk_tokens length {len(basic_model.current_chunk_tokens)} should match input length {input_len}"
+
+        assert logits.shape[2] == VOCAB_SIZE
+
+        # 2. Loss should be returned (includes gate loss if applicable)
+        assert loss is not None
+        assert isinstance(loss, torch.Tensor)
+        assert loss.ndim == 0
+        assert loss.item() >= 0
+
+        # 3. State checks: No cycle means no closed chunks, total_tokens_processed not updated yet
+        assert len(basic_model.closed_chunks) == 0
+        assert basic_model.total_tokens_processed == 0
+
+        # 4. Memory state should not have been updated by a *cycle*
+        # Note: Memory *might* be read by layers, but not updated via cycle passes.
+        # Check against initial state (it should be unchanged as no update cycle ran)
+        for group_id in initial_fwd_mem_copy:
+            assert torch.allclose(basic_model.M_fwd[group_id], initial_fwd_mem_copy[group_id]), \
+                f"M_fwd for group {group_id} changed unexpectedly without a cycle"
+
+        basic_model.eval()  # Reset to eval mode
 
 
 class TestUtilities:

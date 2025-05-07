@@ -708,165 +708,161 @@ class CMAModel(nn.Module):
     def forward(
             self,
             input_ids: Union[str, List[int], List[List[int]], torch.Tensor, None],
-            *, training_mode: bool = False  # Use this parameter
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+            *, training_mode: bool = False
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:  # Logits, Aggregated Gate Loss
         """
-        CMA forward pass. Handles input processing, chunking, triggering update cycles,
-        processing the current chunk, and aggregating gate loss during training.
+        CMA forward pass. Handles input processing, chunking, triggering update cycles.
+        During training and when an update cycle occurs, returns concatenated logits
+        from all chunks of the Forward Pass (Pass 2) and their aggregated gate loss.
+        Otherwise (or in eval mode), returns logits for the current/last processed chunk.
         """
-        print(f"DEBUG: Forward called with input_ids type={type(input_ids)}, training_mode={training_mode}", flush=True)
+        print(f"DEBUG: CMAModel.forward called with input_ids type={type(input_ids)}, training_mode={training_mode}",
+              flush=True)
 
-        # --- Set training state based on parameter ---
-        self.training = training_mode  # Set the nn.Module training state
-
+        self.training = training_mode  # Set nn.Module training state for all submodules
         self._initialize_memory_states(force_reset=False)
         dev = self.token_embedding.weight.device
-        print(f"DEBUG: Device in forward: {dev}", flush=True)
 
-        cycle_gate_loss: Optional[torch.Tensor] = None  # Initialize cycle loss
-        chunk_gate_loss: Optional[torch.Tensor] = None  # Initialize chunk loss
+        # These will store results from the primary processing path
+        final_logits: Optional[torch.Tensor] = None
+        final_gate_loss: Optional[torch.Tensor] = None
 
-        if input_ids in (None, "", [], torch.tensor([], dtype=torch.long)):
+        if input_ids in (None, "", [], torch.tensor([], dtype=torch.long)) or \
+                (isinstance(input_ids, torch.Tensor) and input_ids.numel() == 0):
             if self.current_chunk_tokens:
-                logits, chunk_gate_loss = self._process_current_chunk(generation_mode=not self.training)
+                # _process_current_chunk no longer calls _initialize_memory_states
+                final_logits, final_gate_loss = self._process_current_chunk(generation_mode=not self.training)
             else:
-                logits = torch.zeros(1, 0, self.vocab_size, device=dev)
+                final_logits = torch.zeros(1, 0, self.vocab_size, device=dev)
         else:
+            # --- Input processing and cycle trigger logic (similar to before) ---
             new_tokens: List[int]
-            mode: str
+            input_processing_mode: str  # 'semantic', 'fixed', 'caller_exact'
             if isinstance(input_ids, str):
                 new_tokens = self.tokenizer.encode(input_ids)
-                mode = "semantic"
+                input_processing_mode = "semantic"
             elif isinstance(input_ids, list) and input_ids and isinstance(input_ids[0], list):
-                new_chunks = [list(c) for c in input_ids]
-                new_tokens = [t for c in new_chunks for t in c]
-                mode = "caller_exact"
-            else:
+                # This is List[List[int]], meaning pre-chunked
+                new_chunks_from_input = [list(c) for c in input_ids]
+                new_tokens = [t for c in new_chunks_from_input for t in c]  # Flatten for full_tokens logic
+                input_processing_mode = "caller_exact"
+            else:  # List[int] or Tensor
                 new_tokens = input_ids.tolist() if isinstance(input_ids, torch.Tensor) else list(input_ids)
-                mode = "fixed"
+                input_processing_mode = "fixed"
 
-            print(f"DEBUG: Mode={mode}, new_tokens length={len(new_tokens)}", flush=True)
+            print(f"DEBUG: Mode={input_processing_mode}, new_tokens length={len(new_tokens)}", flush=True)
 
             trigger_update_cycle = False
-            full_tokens = []
-            chunks = []
+            full_tokens_for_cycle: List[int] = []
+            chunks_for_cycle: List[List[int]] = []  # Chunks to be processed in the cycle
 
-            # Heuristic: Assume single-token list inputs are generation steps
-            # Note: This might be imperfect if user provides single-token list input manually
-            is_likely_generation_step = isinstance(input_ids, list) and len(input_ids) == 1
+            is_likely_generation_step = isinstance(input_ids, list) and len(input_ids) == 1 and not isinstance(
+                input_ids[0], list)
 
-            if mode == "caller_exact":
-                # Caller provided exact chunks, always process as a cycle
+            if input_processing_mode == "caller_exact":
                 trigger_update_cycle = True
-                # Combine existing state with new chunks for the cycle
-                full_tokens = [t for c in self.closed_chunks for t in c] + self.current_chunk_tokens + new_tokens
-                chunks = self.closed_chunks + (
-                    [self.current_chunk_tokens] if self.current_chunk_tokens else []) + new_chunks
-                # Clear buffer as it's included in full_tokens now
+                full_tokens_for_cycle = [t for c in self.closed_chunks for t in
+                                         c] + self.current_chunk_tokens + new_tokens
+                # For caller_exact, the input *is* the new chunks to add
+                chunks_for_cycle = self.closed_chunks + \
+                                   ([self.current_chunk_tokens] if self.current_chunk_tokens else []) + \
+                                   new_chunks_from_input
                 self.current_chunk_tokens = []
                 self.current_chunk_text = ""
-
             elif len(self.current_chunk_tokens) + len(new_tokens) >= self.config.chunk_size:
-                # Cycle if chunk fills (applies to both initial load and generation)
                 trigger_update_cycle = True
-                full_tokens = [t for c in self.closed_chunks for t in c] + self.current_chunk_tokens + new_tokens
-                # Clear buffer as it's included in full_tokens now
+                full_tokens_for_cycle = [t for c in self.closed_chunks for t in
+                                         c] + self.current_chunk_tokens + new_tokens
                 self.current_chunk_tokens = []
                 self.current_chunk_text = ""
-
-            elif self.current_chunk_tokens and not is_likely_generation_step and mode in {"semantic", "fixed"}:
-                # Cycle if new non-generation input arrives and buffer is not empty
-                # This handles cases like receiving a new string/list prompt when state exists
+            elif self.current_chunk_tokens and not is_likely_generation_step and input_processing_mode in {"semantic",
+                                                                                                           "fixed"}:
                 trigger_update_cycle = True
-                full_tokens = [t for c in self.closed_chunks for t in c] + self.current_chunk_tokens + new_tokens
-                # Clear buffer as it's included in full_tokens now
+                full_tokens_for_cycle = [t for c in self.closed_chunks for t in
+                                         c] + self.current_chunk_tokens + new_tokens
                 self.current_chunk_tokens = []
                 self.current_chunk_text = ""
-
-            else:
-                # No cycle triggered: Append new tokens to the current buffer
+            else:  # Append to buffer, no cycle
                 self.current_chunk_tokens.extend(new_tokens)
                 try:
-                    # Update text buffer cautiously
                     decoded_new = self.tokenizer.decode(new_tokens)
                     self.current_chunk_text += decoded_new
                 except Exception as e:
-                    # Handle potential decoding errors, especially with partial sequences
                     print(f"Warning: Error decoding appended tokens: {new_tokens}. Error: {e}", flush=True)
-                    # Optionally try to recover or just skip text update for this step
 
-            # --- Trigger cycle OR process current chunk ---
+            # --- Perform update cycle OR process current chunk ---
             if trigger_update_cycle:
-                # --- Memory Reset ---
                 if self.config.reset_memory_on_cycle:
-                    print("Resetting memory states for update cycle.", flush=True)
+                    print("DEBUG: Resetting memory states for update cycle.", flush=True)
                     self._initialize_memory_states(force_reset=True)
 
-                # --- Re-Chunking (if not caller_exact) ---
-                if mode != "caller_exact":
-                    if not full_tokens:
-                        print("Warning: Triggered update cycle but full_tokens is empty.", flush=True)
-                        chunks = []
-                    elif mode == "semantic":
-                        # Decode carefully, handle potential errors
+                if input_processing_mode != "caller_exact":  # Re-chunk if not pre-chunked
+                    if not full_tokens_for_cycle:
+                        chunks_for_cycle = []
+                    elif input_processing_mode == "semantic":
                         try:
-                            full_text = self.tokenizer.decode(full_tokens)
-                            chunks = self.chunk_processor.semantic_chunk_reverse_with_gap(full_text)
+                            full_text = self.tokenizer.decode(full_tokens_for_cycle)
+                            chunks_for_cycle = self.chunk_processor.semantic_chunk_reverse_with_gap(full_text)
                         except Exception as e:
-                            print(f"Error during semantic re-chunking decode: {e}", flush=True)
-                            # Fallback to fixed chunking? Or raise error?
-                            # For now, fallback to fixed:
-                            print("Falling back to fixed-size chunking due to decode error.", flush=True)
-                            chunks = self.chunk_processor.fixed_size_chunk_reverse_with_gap(full_tokens)
-
+                            print(f"Error during semantic re-chunking: {e}. Falling back to fixed.", flush=True)
+                            chunks_for_cycle = self.chunk_processor.fixed_size_chunk_reverse_with_gap(
+                                full_tokens_for_cycle)
                     else:  # fixed
-                        chunks = self.chunk_processor.fixed_size_chunk_reverse_with_gap(full_tokens)
+                        chunks_for_cycle = self.chunk_processor.fixed_size_chunk_reverse_with_gap(full_tokens_for_cycle)
 
-                # --- Run Update Cycle ---
-                if not chunks:
+                if not chunks_for_cycle:
                     print("Warning: Re-chunking resulted in zero chunks. Cycle skipped.", flush=True)
-                    # State remains cleared from trigger logic
-                    self.closed_chunks = []
-                    # current_chunk_tokens is already []
-                    # current_chunk_text is already ""
+                    self.closed_chunks = []  # State cleared
+                    # final_logits will be for empty current_chunk_tokens (processed next)
                 else:
-                    print(f"Triggering memory update cycle with {len(chunks)} chunks.", flush=True)
-                    print(f"DEBUG: About to call _trigger_memory_update_cycle", flush=True)
-                    cycle_gate_loss = self._trigger_memory_update_cycle(chunks)  # Capture loss
-                    print(f"DEBUG: Returned from _trigger_memory_update_cycle", flush=True)
-                    # After cycle, update text buffer based on the new current_chunk_tokens
-                    try:
+                    print(f"DEBUG: Triggering memory update cycle with {len(chunks_for_cycle)} chunks.", flush=True)
+                    # _trigger_memory_update_cycle now needs to return all logits from Pass 2 if training
+                    cycle_logits, cycle_gate_loss = self._trigger_memory_update_cycle(
+                        chunks_for_cycle,
+                        return_all_pass2_logits=self.training
+                    )
+
+                    if self.training:
+                        final_logits = cycle_logits  # These are concatenated logits from Pass 2
+                        final_gate_loss = cycle_gate_loss
+                    else:
+                        # In eval mode, _trigger_memory_update_cycle doesn't return Pass 2 logits.
+                        # We still need to process the (new) current_chunk_tokens for output.
+                        # cycle_gate_loss is still relevant for overall cycle loss if needed, but not added to final_gate_loss here
+                        # as eval loss doesn't include it.
+                        if self.current_chunk_tokens:  # current_chunk_tokens is updated by the cycle
+                            final_logits, _ = self._process_current_chunk(generation_mode=False)
+                            # final_gate_loss for eval mode should be None
+                        else:  # Cycle might have consumed all tokens or left an empty last chunk
+                            final_logits = torch.zeros(1, 0, self.vocab_size, device=dev)
+                        # final_gate_loss remains None for eval if cycle happened
+
+                    try:  # Update text buffer after cycle
                         self.current_chunk_text = self.tokenizer.decode(self.current_chunk_tokens)
                     except Exception as e:
                         print(f"Warning: Error decoding buffer after cycle: {e}", flush=True)
-                        self.current_chunk_text = ""  # Reset text buffer on error
+                        self.current_chunk_text = ""
 
-            # --- Process the final (potentially partial) chunk for logits ---
-            # This runs regardless of whether a cycle was triggered, using the potentially updated self.current_chunk_tokens
-            if self.current_chunk_tokens:
-                # Pass generation_mode=True if this forward call is part of generation loop
-                # We can infer this from is_likely_generation_step or pass explicitly if needed
-                logits, chunk_gate_loss = self._process_current_chunk(
-                    generation_mode=(not self.training))  # Use training flag
-            else:
-                # If cycle happened and last chunk was empty, or no input initially
-                logits = torch.zeros(1, 0, self.vocab_size, device=dev)
-                chunk_gate_loss = None  # No loss if no tokens processed
+            # If no cycle was triggered, or if it was an eval-mode cycle, process current_chunk_tokens
+            if final_logits is None:
+                if self.current_chunk_tokens:
+                    # _process_current_chunk no longer calls _initialize_memory_states
+                    logits_chunk, gate_loss_chunk = self._process_current_chunk(
+                        generation_mode=(not self.training and is_likely_generation_step)
+                    )
+                    final_logits = logits_chunk
+                    if self.training:
+                        final_gate_loss = gate_loss_chunk
+                else:
+                    final_logits = torch.zeros(1, 0, self.vocab_size, device=dev)
 
-        # --- Aggregate Gate Loss ---
-        # (Keep existing aggregation logic)
-        total_gate_loss: Optional[torch.Tensor] = None
-        if self.training and self.config.gate_regularization_type is not None:
-            if cycle_gate_loss is not None and chunk_gate_loss is not None:
-                total_gate_loss = cycle_gate_loss + chunk_gate_loss
-            elif cycle_gate_loss is not None:
-                total_gate_loss = cycle_gate_loss
-            elif chunk_gate_loss is not None:
-                total_gate_loss = chunk_gate_loss
-            # If both are None, total_gate_loss remains None
+        # Ensure final_logits is not None (e.g. if all paths somehow missed)
+        if final_logits is None:
+            final_logits = torch.zeros(1, 0, self.vocab_size, device=dev)
 
-        # --- Return logits and the final aggregated gate loss ---
-        return logits, total_gate_loss
+        # final_gate_loss is now the aggregated gate loss from the relevant path
+        # (either cycle Pass 2 if training, or _process_current_chunk if training and no cycle)
+        return final_logits, final_gate_loss
 
     def _process_current_chunk(self, generation_mode: bool = False) -> Tuple[
         torch.Tensor, Optional[torch.Tensor]]:  # Updated return signature
@@ -875,13 +871,17 @@ class CMAModel(nn.Module):
         Returns logits and accumulated gate loss for this chunk.
         """
         if not self.current_chunk_tokens:
-            return torch.zeros(1, 0, self.vocab_size,
-                               device=self.token_embedding.weight.device), None  # No loss if no tokens
-        self._initialize_memory_states(force_reset=False)
+            # No loss if no tokens
+            return torch.zeros(1, 0, self.vocab_size, device=self.token_embedding.weight.device), None
         dev = self.token_embedding.weight.device
 
         chunk_idx = len(self.closed_chunks)
         total_chunks_in_history = chunk_idx + 1
+        # Ensure current_chunk_tokens is not empty before creating tensor
+        if not self.current_chunk_tokens:
+            # This case should be caught above, but double-check
+            return torch.zeros(1, 0, self.vocab_size, device=dev), None
+
         chunk_tensor = torch.tensor(self.current_chunk_tokens, device=dev, dtype=torch.long).unsqueeze(0)  # (1, T)
         B, T = chunk_tensor.shape
         x = self.token_embedding(chunk_tensor)  # (1, T, D)
@@ -936,61 +936,135 @@ class CMAModel(nn.Module):
         # Return logits and the accumulated gate loss for this chunk
         return logits, aggregated_gate_loss
 
-    def _trigger_memory_update_cycle(self, chunks: List[List[int]]) -> Optional[torch.Tensor]:
+    def _trigger_memory_update_cycle(
+            self,
+            chunks: List[List[int]],
+            return_all_pass2_logits: bool = False
+    ) -> Tuple[
+        Optional[torch.Tensor], Optional[torch.Tensor]]:  # (Optional[all_pass2_logits], Optional[pass2_gate_loss])
         """
         Processes the full sequence of chunks through the 3-pass cycle.
-        Returns aggregated gate loss from the forward pass if applicable.
+        If return_all_pass2_logits is True, returns concatenated logits from Pass 2
+        and its aggregated gate loss. Otherwise, returns (None, pass2_gate_loss_if_any).
         """
-        print(f"DEBUG: Starting _trigger_memory_update_cycle with {len(chunks)} chunks", flush=True)
-
+        print(
+            f"DEBUG: Starting _trigger_memory_update_cycle with {len(chunks)} chunks, return_all_pass2_logits={return_all_pass2_logits}",
+            flush=True)
         if not chunks:
-            print("Warning: _trigger_memory_update_cycle called with empty chunks list.", flush=True)
-            return None
+            return None, None
 
-        print(f"Running 3-pass update cycle on {len(chunks)} chunks...", flush=True)
         dev = self.token_embedding.weight.device
-        print(f"DEBUG: Device is {dev}", flush=True)
+        B = 1  # Assuming batch size 1 for stateful processing
 
-        B = 1
-        cycle_gate_loss: Optional[torch.Tensor] = None  # Initialize
-
-        print("  Starting Pass 1: Lookahead Reverse...", flush=True)
-        print(f"DEBUG: About to call _run_lookahead_reverse_pass with chunks={len(chunks)}, B={B}, dev={dev}", flush=True)
-
+        # --- Pass 1: Lookahead Reverse ---
         try:
             M_rev_ahead_computed = self._run_lookahead_reverse_pass(chunks, B, dev)
-            print("DEBUG: Successfully completed _run_lookahead_reverse_pass", flush=True)
         except Exception as e:
-            print(f"ERROR in _run_lookahead_reverse_pass: {type(e).__name__}: {e}", flush=True)
-            import traceback
-            traceback.print_exc()
+            print(f"ERROR in _run_lookahead_reverse_pass: {e}", flush=True);
             raise
 
-        print("  Finished Pass 1.", flush=True)
+        # --- Pass 2: Forward ---
+        pass2_logits_list: List[torch.Tensor] = []
+        pass2_gate_loss_aggregated: Optional[torch.Tensor] = None
 
-        print("  Starting Pass 2: Forward...", flush=True)
-        # --- Capture the returned gate loss from the forward pass ---
-        cycle_gate_loss = self._run_forward_pass(chunks, M_rev_ahead_computed, B, dev)
-        print("  Finished Pass 2.", flush=True)
+        tokens_processed_before_cycle = self.total_tokens_processed  # For get_effective_size
+        current_total_processed_for_pass2 = tokens_processed_before_cycle
 
+        for chunk_idx, chunk_tokens in enumerate(chunks):
+            if not chunk_tokens: continue  # Skip empty chunks
+
+            chunk_tensor = torch.tensor(chunk_tokens, dtype=torch.long, device=dev).unsqueeze(0)
+            x = self.token_embedding(chunk_tensor)  # (B, T_chunk, D)
+
+            # Control tokens for this chunk in Pass 2
+            current_mem_size = self.memory_manager.get_effective_size(current_total_processed_for_pass2)
+            ctrl = self.control_token_generator.generate_control_tokens(
+                mode="forward", current_chunk_idx=chunk_idx, total_chunks=len(chunks),
+                current_mem_size=current_mem_size, max_mem_size=self.config.max_memory_size,
+                seq_len=current_total_processed_for_pass2
+            )
+
+            # Determine M_rev_persist to use for this chunk (masking if training)
+            M_rev_persist_for_chunk: Dict[int, Tensor]
+            if self.training and self.config.enable_mask_future_dropout:
+                p_drop = get_mask_future_schedule(self.config, self.training_step, self.total_training_steps)
+                M_rev_persist_for_chunk = self._mask_persistent_memory(self.M_rev_persist, p_drop)
+            else:
+                M_rev_persist_for_chunk = self.M_rev_persist
+
+            chunk_gate_loss_accumulator_for_layers: Optional[torch.Tensor] = None
+
+            for layer_idx, layer_block in enumerate(self.layers):  # Changed 'layer' to 'layer_block'
+                group_idx = self.layer_idx_to_group_idx[layer_idx]
+                group = self.layer_groups[group_idx]
+
+                wmask = None
+                # Write mask for memory_update layers in this group
+                if group.has_memory and layer_idx == group.memory_update_layer_idx:
+                    wmask = self.memory_manager.get_write_mask(
+                        current_chunk_idx_in_pass=chunk_idx,
+                        total_chunks_in_pass=len(chunks),
+                        total_tokens_processed_before_chunk=current_total_processed_for_pass2,
+                        batch_size=B, device=dev
+                    )
+
+                # Process layer
+                x, updated_fwd, _, layer_gate_loss = layer_block(
+                    x, M_fwd_dict=self.M_fwd, M_rev_ahead_dict=M_rev_ahead_computed,
+                    M_rev_persist_dict=M_rev_persist_for_chunk,  # Use potentially masked
+                    group_id=group_idx, mode="forward", control_tokens=ctrl,
+                    write_mask=wmask, decay_weights=None
+                )
+
+                if updated_fwd is not None:
+                    g_id, mem = updated_fwd
+                    self.M_fwd[g_id] = mem  # Update self.M_fwd directly
+
+                if layer_gate_loss is not None:
+                    current_loss = layer_gate_loss.mean() if layer_gate_loss.numel() > 1 else layer_gate_loss
+                    if chunk_gate_loss_accumulator_for_layers is None:
+                        chunk_gate_loss_accumulator_for_layers = current_loss
+                    else:
+                        chunk_gate_loss_accumulator_for_layers += current_loss
+
+            # After processing chunk through all layers:
+            # x is now the output for this chunk (B, T_chunk, D)
+            # Apply final norm and lm_head to get logits for this chunk
+            logits_for_chunk = self.lm_head(norm(x))  # (B, T_chunk, VocabSize)
+
+            if return_all_pass2_logits:
+                pass2_logits_list.append(logits_for_chunk)
+
+            if chunk_gate_loss_accumulator_for_layers is not None:
+                if pass2_gate_loss_aggregated is None:
+                    pass2_gate_loss_aggregated = chunk_gate_loss_accumulator_for_layers
+                else:
+                    pass2_gate_loss_aggregated += chunk_gate_loss_accumulator_for_layers
+
+            current_total_processed_for_pass2 += len(chunk_tokens)
+
+        # Clear temporary lookahead memory
         del M_rev_ahead_computed
-        self.M_rev_ahead = {}  # Clear the temporary lookahead reverse memory
+        self.M_rev_ahead = {}
 
-        print("  Starting Pass 3: Persistent Reverse...", flush=True)
-        self._run_persistent_reverse_pass(chunks, B, dev)
-        print("  Finished Pass 3.", flush=True)
+        # --- Pass 3: Persistent Reverse ---
+        self._run_persistent_reverse_pass(chunks, B, dev)  # This updates self.M_rev_persist
 
-        # Update state after successful cycle
+        # Update model state after successful cycle
         self.closed_chunks = chunks[:-1]
-        self.current_chunk_tokens = chunks[-1]
+        self.current_chunk_tokens = chunks[-1] if chunks else []
         new_total_tokens = sum(len(c) for c in chunks)
-        print(
-            f"  Update cycle complete. Updating total_tokens_processed from {self.total_tokens_processed} to {new_total_tokens}", flush=True)
-        self.total_tokens_processed = new_total_tokens
+        self.total_tokens_processed = new_total_tokens  # Update based on chunks processed in this cycle
         self.tokens_since_persistent_update = 0
 
-        # --- Return the aggregated gate loss from the forward pass ---
-        return cycle_gate_loss
+        concatenated_pass2_logits: Optional[torch.Tensor] = None
+        if return_all_pass2_logits and pass2_logits_list:
+            # Concatenate along the sequence dimension (dim=1 for (B, T, D))
+            concatenated_pass2_logits = torch.cat(pass2_logits_list, dim=1)
+        elif return_all_pass2_logits:  # List is empty (e.g. all chunks were empty)
+            concatenated_pass2_logits = torch.zeros(B, 0, self.vocab_size, device=dev)
+
+        return concatenated_pass2_logits, pass2_gate_loss_aggregated
 
     def _process_chunk_in_cycle(
             self,
@@ -1162,82 +1236,6 @@ class CMAModel(nn.Module):
             import traceback
             traceback.print_exc()
             raise
-
-    def _run_forward_pass(self, all_chunks: List[List[int]], M_rev_ahead_computed: Dict[int, Tensor], B: int,
-                          dev: torch.device) -> Optional[torch.Tensor]:
-        """ Runs the forward pass over all chunks, returning aggregated gate loss if applicable. """
-        n_chunks = len(all_chunks)
-        tokens_processed_before_cycle = self.total_tokens_processed
-        tokens_processed_in_pass = 0
-
-        M_fwd = self.M_fwd  # Will be updated in-place via layer returns
-
-        # --- Handle Persistent Reverse Memory Masking (Training Only) ---
-        M_rev_persist_to_use: Dict[int, Tensor]
-        if self.training and self.config.enable_mask_future_dropout:
-            # Calculate dropout probability based on schedule
-            p_drop = get_mask_future_schedule(self.config, self.training_step, self.total_training_steps)
-            print(f"  Forward Pass (Training): Applying mask-future dropout with p={p_drop:.3f}")
-            # Create a masked copy for this pass
-            M_rev_persist_to_use = self._mask_persistent_memory(self.M_rev_persist, p_drop)
-        else:
-            # Use the original persistent memory during inference or if disabled
-            M_rev_persist_to_use = self.M_rev_persist
-        # --- End Masking ---
-
-        forward_gate_loss: Optional[torch.Tensor] = None
-
-        for chunk_idx, chunk_tokens in enumerate(all_chunks):
-            chunk_tensor = torch.tensor(chunk_tokens, dtype=torch.long, device=dev).unsqueeze(0)
-            x = self.token_embedding(chunk_tensor)
-
-            current_total_processed_before_chunk = tokens_processed_before_cycle + tokens_processed_in_pass
-
-            current_mem_size = self.memory_manager.get_effective_size(current_total_processed_before_chunk)
-            ctrl = self.control_token_generator.generate_control_tokens(
-                mode="forward", current_chunk_idx=chunk_idx, total_chunks=n_chunks,
-                current_mem_size=current_mem_size, max_mem_size=self.config.max_memory_size,
-                seq_len=current_total_processed_before_chunk
-            )
-
-            for layer_idx, layer in enumerate(self.layers):
-                group_idx = self.layer_idx_to_group_idx[layer_idx]
-                group = self.layer_groups[group_idx]
-
-                wmask = None
-                if group.has_memory and layer_idx == group.memory_update_layer_idx:
-                    wmask = self.memory_manager.get_write_mask(
-                        current_chunk_idx_in_pass=chunk_idx,
-                        total_chunks_in_pass=n_chunks,
-                        total_tokens_processed_before_chunk=current_total_processed_before_chunk,
-                        batch_size=B,
-                        device=dev
-                    )
-
-                # --- Pass the potentially masked persistent memory ---
-                x, updated_fwd, _, _gate_loss = layer(
-                    x,
-                    M_fwd_dict=M_fwd,
-                    M_rev_ahead_dict=M_rev_ahead_computed,  # Lookahead reverse (computed in Pass 1)
-                    M_rev_persist_dict=M_rev_persist_to_use,  # Persistent reverse (potentially masked)
-                    group_id=group_idx, mode="forward", control_tokens=ctrl,
-                    write_mask=wmask, decay_weights=None
-                )
-
-                if _gate_loss is not None:
-                    current_loss = _gate_loss.mean() if _gate_loss.numel() > 1 else _gate_loss
-                    if forward_gate_loss is None:
-                        forward_gate_loss = current_loss
-                    else:
-                        forward_gate_loss += current_loss
-
-                if updated_fwd is not None:
-                    g_id, mem = updated_fwd
-                    self.M_fwd[g_id] = mem
-
-            tokens_processed_in_pass += len(chunk_tokens)
-
-        return forward_gate_loss
 
     def _run_persistent_reverse_pass(self, all_chunks: List[List[int]], B: int, dev: torch.device):
         """ Runs the persistent reverse pass. """
@@ -1435,7 +1433,6 @@ class CMAModel(nn.Module):
             next_id = _sample_row(logits[0, -1, :])
             print(f"DEBUG: Sampled token ID: {next_id}", flush=True)
 
-            # --- FIX: Append the token BEFORE checking if it's the stop token ---
             generated.append(next_id)
 
             # Check for stop token
