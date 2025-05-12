@@ -1,3 +1,4 @@
+import math
 import os
 import sys
 from typing import Union
@@ -21,7 +22,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 # Import CMA model
-from cma_model import CMAModel
+from cma_model import CMAModel, CascadeMemoryAttention
 from cma_components import CMAConfig
 
 
@@ -137,18 +138,22 @@ class Muon(torch.optim.Optimizer):
 class CMADataHandler:
     """Handles data loading for CMA training with chunked processing"""
 
-    def __init__(self, train_files: str, val_files: str, val_tokens: int, rank: int, world_size: int,
-                 train_seq_len_multiplier: int = 4, val_seq_len_multiplier: int = 8):
+    def __init__(self, train_files: str, val_files: str, train_tokens: int, val_tokens: int, rank: int, world_size: int):
         self.train_files = train_files
         self.val_files = val_files
+        self.train_tokens = train_tokens
         self.val_tokens = val_tokens
         self.rank = rank
         self.world_size = world_size
-        self.train_seq_len_multiplier = train_seq_len_multiplier
-        self.val_seq_len_multiplier = val_seq_len_multiplier
+
 
         # For CMA, we don't use batch sequences like GPT, we process one sequence at a time
         self.batch_size = 1
+
+        self.chunk_size = 0
+
+    def set_chunk_size(self, chunk_size: int):
+        self.chunk_size = chunk_size
 
     def _load_data_shard(self, file: Path):
         header = torch.from_file(str(file), False, 256, dtype=torch.int32)
@@ -162,7 +167,7 @@ class CMADataHandler:
             assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
         return tokens
 
-    def get_training_data_generator(self, chunk_size: int):
+    def get_training_data_generator(self):
         """Generate training data in chunks for CMA processing"""
         files = [Path(file) for file in sorted(glob.glob(self.train_files))]
         file_iter = iter(files)
@@ -170,8 +175,8 @@ class CMADataHandler:
 
         while True:
             # For training, we need sequences longer than chunk_size to allow full update cycles
-            min_seq_len = chunk_size * self.train_seq_len_multiplier
-            max_seq_len = chunk_size * (self.train_seq_len_multiplier * 2)
+            min_seq_len = self.train_tokens #chunk_size * self.train_seq_len_multiplier
+            max_seq_len = self.train_tokens #chunk_size * (self.train_seq_len_multiplier * 2)
 
             # Check if we need to load next shard
             if pos + min_seq_len >= len(tokens):
@@ -200,31 +205,33 @@ class CMADataHandler:
             pos += actual_seq_len
             yield inputs, targets
 
-    def get_validation_data_generator(self, chunk_size: int):
+    def get_validation_data_generator(self):
         """Generate validation data in chunks"""
         files = [Path(file) for file in sorted(glob.glob(self.val_files))]
-        val_batch_size = self.world_size * chunk_size * self.val_seq_len_multiplier
+        val_batch_size = self.world_size * self.train_tokens
 
         #assert self.val_tokens % val_batch_size == 0
-        val_steps = self.val_tokens // val_batch_size
+        val_steps = math.ceil(float(self.val_tokens) / val_batch_size)
+        processed_tokens = 0
 
         file_iter = iter(files)
         tokens, pos = self._load_data_shard(next(file_iter)), 0
 
         for _ in range(val_steps):
+            seq_len = min(self.train_tokens, self.val_tokens - processed_tokens)
             # Check if we need to load next shard
-            if pos + val_batch_size + 1 >= len(tokens):
+            if pos + seq_len + 1 >= len(tokens):
                 tokens, pos = self._load_data_shard(next(file_iter)), 0
 
             # Extract validation sequence
-            seq_len = chunk_size * self.val_seq_len_multiplier
             seq = tokens[pos + self.rank * seq_len:pos + (self.rank + 1) * seq_len + 1]
 
             # Send to device
             inputs = seq[:-1].to(dtype=torch.int32, device="cuda", non_blocking=True)
             targets = seq[1:].to(dtype=torch.int64, device="cuda", non_blocking=True)
 
-            pos += val_batch_size
+            pos += self.world_size * seq_len
+            processed_tokens += self.world_size * seq_len
             yield inputs, targets
 
 
@@ -255,9 +262,7 @@ class CMATrainingHelper:
 
         # Logits from model.forward are now potentially concatenated from all Pass 2 chunks
         # Gate_loss is also aggregated from all Pass 2 chunks
-        print0("train_step running model forward...")
         logits, gate_loss = self.model(inputs_token_ids, training_mode=True)
-        print0("train_step model forward complete.")
 
         pred_loss_normalized = torch.tensor(0.0, device=logits.device)  # Match logits device
 
@@ -310,9 +315,7 @@ class CMATrainingHelper:
         with torch.no_grad():
             # training_mode=False, gate_loss is ignored
             #print(inputs_token_ids)
-            print0("val_step running model forward...")
             logits, _gate_loss_ignored = self.model(inputs_token_ids, training_mode=False)
-            print0("val_step model forward complete.")
 
             if logits.numel() > 0 and logits.size(1) > 0:
                 num_predicted_tokens = logits.size(1)
@@ -343,14 +346,13 @@ class CMATrainingHelper:
 
 @dataclass
 class Hyperparameters:
-    DEBUG_LEVEL = 0  # 0=warnings/errors/etc. only, 1=debug, 2=info
+    DEBUG_LEVEL = 2  # 0=warnings/errors/etc. only, 1=debug, 2=info
 
     # data
     train_files = "data/fineweb10B/fineweb_train_*.bin"
     val_files = "data/fineweb10B/fineweb_val_*.bin"
-    val_tokens = 10485760
-    train_seq_len_multiplier = 4  # Training sequences will be chunk_size * this
-    val_seq_len_multiplier = 8  # Validation sequences will be chunk_size * this
+    val_tokens = 20480 #10485760
+    train_seq_len = 10240  # Should be ~10240??
 
     # CMA specific
     chunk_size_min = 256 #128 #256  # Chunk size starts here and...
@@ -361,10 +363,10 @@ class Hyperparameters:
 
     # model architecture  
     vocab_size = 50257
-    embed_dim = 256 #768
+    embed_dim = 512 #768
     n_heads = 4 #6
-    head_dim = 64 #128  # Typically embed_dim // n_heads
-    n_layers = 3 #12
+    head_dim = 128 #128  # Typically embed_dim // n_heads
+    n_layers = 6 #12
 
     # optimization
     num_iterations = 1770
@@ -377,6 +379,8 @@ class Hyperparameters:
 
 
 args = Hyperparameters()
+
+assert args.train_seq_len > args.chunk_size_min
 
 # Setup distributed training
 try:
@@ -410,9 +414,9 @@ if master_process:
 def print0(s, console=False):
     if master_process:
         with open(logfile, "a") as f:
-            if console or args.DEBUG_LEVEL > 0:
-                print(s)
-            print(s, file=f)
+            if console:
+                print(s, flush=True)
+            print(s, file=f, flush=True)
 
 
 # Log initial information
@@ -434,20 +438,22 @@ config = CMAConfig(
     n_layers=args.n_layers,
     share_initial_memory=True,
     reset_memory_on_cycle=True,
-    enable_mask_future_dropout=True,
+    enable_mask_future_dropout=False,
     gate_regularization_type="l1",  # Enable gate regularization as per training methodology
     gate_regularization_strength=0.001,
     # Use simple layer structure for now
     layer_structure=[
-        {"type": "local_only"} if i % 3 != 2 else {"type": "memory_update"}
+        {"type": "local_only"} if i % args.n_layers != args.n_layers-1 else {"type": "memory_update"}
         for i in range(args.n_layers)
     ],
-    DEBUG_LEVEL=args.DEBUG_LEVEL
+    DEBUG_LEVEL=args.DEBUG_LEVEL,
+    logfile=logfile
 )
 
 # Create model
 model_without_ddp = CMAModel(config, args.vocab_size).cuda() # Create the base model
-print0(f"Model created with {sum(p.numel() for p in model_without_ddp.parameters())} parameters")
+total_params = sum(p.numel() for p in model_without_ddp.parameters())
+print0(f"Model created with {total_params} parameters", console=True)
 
 # DDP Setup
 ddp_active = False
@@ -476,58 +482,195 @@ else:
 underlying_model = model.module if ddp_active else model
 
 data_handler = CMADataHandler(
-    args.train_files, args.val_files, args.val_tokens, rank, world_size,
-    args.train_seq_len_multiplier, args.val_seq_len_multiplier
+    args.train_files, args.val_files, args.train_seq_len, args.val_tokens, rank, world_size
 )
+train_loader = data_handler.get_training_data_generator()
 # Pass the underlying_model to CMATrainingHelper if it needs to access specific
 # attributes of CMAModel not exposed by DDP wrapper (like .config directly).
 # However, CMATrainingHelper as written primarily calls model.train(), model.eval(), model.forward(),
 # model.set_training_step(), model.reset_state() which are fine with DDP wrapper.
 # Let's adjust CMATrainingHelper to expect the potentially DDP-wrapped model and access .module if needed.
 training_helper = CMATrainingHelper(model, ddp_active)  # Pass model and ddp_active flag
-print0("Data handler and training helper create.")
+print0("Data handler and training helper created.")
 
 # Collect parameters for different optimizers
-hidden_matrix_params = []
-embed_params = []
-scalar_params = []
-gate_params = []  # CMA-specific gate parameters
-initial_memory_params = []  # Initial memory parameters
+#print0("Parameter Grouping...", console=True)
+# --- Adam Parameters ---
+adam_params_dict = {}  # Use a dictionary to avoid duplicate additions by name
 
-# Access parameters from the underlying model to ensure names are consistent
-for name, param in underlying_model.named_parameters(): # Iterate over underlying_model.named_parameters()
-    if "initial" in name and "params" in name:
-        initial_memory_params.append(param)
-    elif "embed" in name: # This includes token_embedding and potentially others
-        embed_params.append(param)
-    elif param.ndim >= 2:
-        if "gate" in name: # CMA gate projections
-            gate_params.append(param)
-        else: # Other 2D+ params like QKV, MLP linears
-            hidden_matrix_params.append(param)
-    else: # Bias terms, other 1D params
-        scalar_params.append(param)
+# 1. LM Head (Explicit)
+# lm_head.weight is typically a 2D matrix.
+# If lm_head has a bias, it's 1D.
+for name, p in underlying_model.lm_head.named_parameters():
+    if p.requires_grad:
+        adam_params_dict[f"lm_head.{name}"] = p
+#print0(f"Collected {len(adam_params_dict)} params for lm_head initially for Adam.", console=True)
 
-# Adam params:
-adam_param_groups = [
-    dict(params=list(underlying_model.lm_head.parameters()), lr=0.22), # Access lm_head from underlying_model
-    dict(params=embed_params, lr=0.6), # embed_params collected from underlying_model
-    dict(params=scalar_params, lr=0.04), # scalar_params collected from underlying_model
-    dict(params=gate_params, lr=0.04),   # gate_params collected from underlying_model
-    dict(params=initial_memory_params, lr=0.08) # initial_memory_params collected from underlying_model
+# 2. Embeddings (Token embedding primarily)
+# token_embedding.weight is 2D
+current_adam_count = len(adam_params_dict)
+for name, p in underlying_model.token_embedding.named_parameters():
+    full_name = f"token_embedding.{name}"
+    if p.requires_grad and full_name not in adam_params_dict:
+        adam_params_dict[full_name] = p
+#print0(f"Collected {len(adam_params_dict) - current_adam_count} params for token_embedding for Adam.", console=True)
+
+# 3. Initial Memory Parameters (Explicit by name)
+# These are 3D but often treated with Adam-like optimizers due to their unique role.
+current_adam_count = len(adam_params_dict)
+if hasattr(underlying_model, 'initial_fwd_params'):
+    for i, p in enumerate(underlying_model.initial_fwd_params):
+        if p.requires_grad and f"initial_fwd_params.{i}" not in adam_params_dict:
+            adam_params_dict[f"initial_fwd_params.{i}"] = p
+if hasattr(underlying_model, 'initial_rev_s_params'):
+    for i, p in enumerate(underlying_model.initial_rev_s_params):
+        if p.requires_grad and f"initial_rev_s_params.{i}" not in adam_params_dict:
+            adam_params_dict[f"initial_rev_s_params.{i}"] = p
+if hasattr(underlying_model, 'initial_rev_p_params'):
+    for i, p in enumerate(underlying_model.initial_rev_p_params):
+        if p.requires_grad and f"initial_rev_p_params.{i}" not in adam_params_dict:
+            adam_params_dict[f"initial_rev_p_params.{i}"] = p
+#print0(f"Collected {len(adam_params_dict) - current_adam_count} params for initial_memories for Adam.", console=True)
+
+# --- Iterate All Parameters for Remaining Adam Groups and Muon ---
+# Keep track of parameters assigned to Adam to give the rest to Muon
+adam_assigned_param_ids = {id(p) for p in adam_params_dict.values()}
+
+# Parameters specifically for Adam (usually 1D or special 2D like gates)
+other_adam_params_by_group = {
+    "cma_attn_gates": [],  # CascadeMemoryAttention.gate_proj (weights & biases)
+    "cma_control_proj": [],  # CascadeMemoryAttention.control_proj (weights)
+    "cma_update_gates": [],  # fwd_memory_gate_proj, rev_memory_gate_proj (weights)
+    "other_biases_and_scalars": [],  # All other 1D params
+}
+
+# Parameters for Muon (2D+ matrices not explicitly in Adam)
+muon_candidate_params = []
+
+for name, param in underlying_model.named_parameters():
+    if not param.requires_grad or id(param) in adam_assigned_param_ids:
+        continue  # Skip if no grad or already explicitly handled for Adam
+
+    # CMA Specific Components that often go to Adam
+    if "control_proj" in name:  # control_proj.weight (2D)
+        other_adam_params_by_group["cma_control_proj"].append(param)
+        adam_assigned_param_ids.add(id(param))
+    elif "gate_proj" in name:  # CascadeMemoryAttention.gate_proj (attn gate W+B)
+        other_adam_params_by_group["cma_attn_gates"].append(param)
+        adam_assigned_param_ids.add(id(param))
+    elif "memory_gate_proj" in name:  # fwd/rev_memory_gate_proj (update gate W)
+        other_adam_params_by_group["cma_update_gates"].append(param)
+        adam_assigned_param_ids.add(id(param))
+    elif param.ndim < 2:  # All other 1D params (biases, single norms if any)
+        other_adam_params_by_group["other_biases_and_scalars"].append(param)
+        adam_assigned_param_ids.add(id(param))
+    elif param.ndim >= 2:  # Candidate for Muon
+        muon_candidate_params.append(param)
+    else:
+        print0(f"Warning: Unhandled parameter during iteration: {name}", console=True)
+
+# Construct Adam param groups
+adam_param_groups_list = [
+    dict(params=list(underlying_model.lm_head.parameters()), lr=0.20, name="lm_head"),
+    dict(params=list(underlying_model.token_embedding.parameters()), lr=0.6, name="token_embedding")
 ]
-# Filter out empty param groups that might occur if a category has no params
-adam_params_filtered = [pg for pg in adam_param_groups if pg['params']]
+if hasattr(underlying_model, 'initial_fwd_params') and underlying_model.initial_fwd_params:
+    adam_param_groups_list.append(
+        dict(params=list(underlying_model.initial_fwd_params), lr=0.06, name="initial_fwd_mem"))
+if hasattr(underlying_model, 'initial_rev_s_params') and underlying_model.initial_rev_s_params:
+    adam_param_groups_list.append(
+        dict(params=list(underlying_model.initial_rev_s_params), lr=0.06, name="initial_rev_s_mem"))
+if hasattr(underlying_model, 'initial_rev_p_params') and underlying_model.initial_rev_p_params:
+    adam_param_groups_list.append(
+        dict(params=list(underlying_model.initial_rev_p_params), lr=0.06, name="initial_rev_p_mem"))
 
+if other_adam_params_by_group["cma_control_proj"]:
+    adam_param_groups_list.append(
+        dict(params=other_adam_params_by_group["cma_control_proj"], lr=0.03, name="cma_control_proj"))
+if other_adam_params_by_group["cma_attn_gates"]:
+    adam_param_groups_list.append(
+        dict(params=other_adam_params_by_group["cma_attn_gates"], lr=0.03, name="cma_attn_gates"))
+if other_adam_params_by_group["cma_update_gates"]:
+    adam_param_groups_list.append(
+        dict(params=other_adam_params_by_group["cma_update_gates"], lr=0.03, name="cma_update_gates"))
+if other_adam_params_by_group["other_biases_and_scalars"]:
+    adam_param_groups_list.append(
+        dict(params=other_adam_params_by_group["other_biases_and_scalars"], lr=0.04, name="other_biases_scalars"))
 
-optimizer1 = torch.optim.Adam(adam_params_filtered, betas=(0.8, 0.95), eps=1e-10, fused=True)
-optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size)
+adam_param_groups_filtered = [pg for pg in adam_param_groups_list if pg['params']]
+
+#print0("--- Adam Groups ---", console=True)
+total_adam_params = 0
+for pg in adam_param_groups_filtered:
+    current_pg_params = sum(p.numel() for p in pg['params'])
+    total_adam_params += current_pg_params
+    #print0(f"Adam group: {pg['name']}, Num params: {current_pg_params}, LR: {pg['lr']}", console=True)
+#print0(f"Total Adam params: {total_adam_params}", console=True)
+
+# Muon gets all remaining 2D+ params
+final_muon_params = []
+for p_muon_cand in muon_candidate_params:
+    # Double check it wasn't somehow added to Adam (shouldn't be necessary with current logic, but safe)
+    if id(p_muon_cand) not in adam_assigned_param_ids:
+        final_muon_params.append(p_muon_cand)
+    else:  # This case means a 2D+ param was explicitly assigned to Adam (e.g. control_proj if it was 2D)
+        pass  # Already handled by Adam
+
+#print0("--- Muon Group ---", console=True)
+total_muon_params = sum(p.numel() for p in final_muon_params)
+#print0(f"Muon params: Num params: {total_muon_params}", console=True)
+
+# Final Verification
+total_optimized_params = 0
+all_optimized_param_ids = set()
+
+for pg in adam_param_groups_filtered:
+    for p in pg['params']:
+        if id(p) in all_optimized_param_ids:
+            print0(f"CRITICAL WARNING: Param {p.shape} assigned to multiple Adam groups!", console=True)
+        all_optimized_param_ids.add(id(p))
+        total_optimized_params += p.numel()
+
+for p in final_muon_params:
+    if id(p) in all_optimized_param_ids:
+        print0(f"CRITICAL WARNING: Param {p.shape} assigned to both Adam and Muon!", console=True)
+    all_optimized_param_ids.add(id(p))
+    total_optimized_params += p.numel()  # This line was missing in my prev total count
+
+#print0(f"Total params in optimizer groups: {total_optimized_params}", console=True)
+total_model_params_requiring_grad = sum(p.numel() for p in underlying_model.parameters() if p.requires_grad)
+#print0(f"Total model params requiring grad: {total_model_params_requiring_grad}", console=True)
+
+if total_optimized_params != total_model_params_requiring_grad:
+    print0("CRITICAL WARNING: Optimizer parameter count MISMATCH!", console=True)
+    all_model_param_ids = {id(p) for p in underlying_model.parameters() if p.requires_grad}
+
+    missing_from_optimizer_ids = all_model_param_ids - all_optimized_param_ids
+    if missing_from_optimizer_ids:
+        print0(f"Missing from optimizer ({len(missing_from_optimizer_ids)} params):", console=True)
+        for name, p_model in underlying_model.named_parameters():
+            if id(p_model) in missing_from_optimizer_ids:
+                print0(f"  - {name} (Shape: {p_model.shape}, Numel: {p_model.numel()})", console=True)
+
+    extra_in_optimizer_ids = all_optimized_param_ids - all_model_param_ids
+    if extra_in_optimizer_ids:  # Should be empty
+        print0(f"CRITICAL WARNING: Extra in optimizer ({len(extra_in_optimizer_ids)} params) - THIS IS A BUG IN SCRIPT", console=True)
+else:
+    #print0("Parameter coverage check: OKAY", console=True)
+    pass
+
+optimizer1 = torch.optim.Adam(adam_param_groups_filtered, betas=(0.8, 0.95), eps=1e-10, fused=True)
+optimizer2 = Muon(final_muon_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size)
 optimizers = [optimizer1, optimizer2]
 
 for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
-print0(f"Optimizers created. Adam has {len(adam_params_filtered)} parameters, Muon has {len(hidden_matrix_params)} parameters.")
+adam_params = {p for g in optimizer1.param_groups for p in g['params']}
+print0(f"Adam ▶ {len(adam_params)} tensors, {total_adam_params:,} scalars", console=True)
+print0(f"Muon ▶ {len(final_muon_params)} tensors, {total_muon_params:,} scalars", console=True)
+#print0(f"Combined ▶ {total_optimized_params:,} scalars", console=True)
+assert total_params == total_optimized_params
 
 
 # Learning rate schedule
@@ -543,7 +686,6 @@ def get_lr(step: int):
 
 # Curriculum learning: progressively increase chunk size
 def get_chunk_size(step: int):
-    return args.chunk_size_max
     x = step / (args.num_iterations * 0.8)
     # Linearly increase from 256 to 768 tokens
     min_chunk_size = args.chunk_size_min
@@ -553,25 +695,26 @@ def get_chunk_size(step: int):
 
 
 # Compile model (if using PyTorch 2.0+)
-print0("Compiling model...")
+print0("Compiling model...", console=True)
 try:
     model = torch.compile(model, dynamic=False)
-    print0("Compile complete.")
+    print0("Compile complete.", console=True)
 except:
-    print0("Warning: torch.compile not available, running uncompiled model")
+    print0("Warning: torch.compile not available, running uncompiled model", console=True)
 
 # Training loop
 training_time_ms = 0
 torch.cuda.synchronize()
 t0 = time.perf_counter()
 
-print0("Starting main training loop.")
+print0("Starting main training loop.", console=True)
 train_steps = args.num_iterations
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
 
     # Get current chunk size for curriculum learning
     current_chunk_size = get_chunk_size(step)
+    data_handler.set_chunk_size(current_chunk_size)
 
     # Update model's chunk_size (Fix #1: Chunk Size Curriculum)
     current_model_instance = model.module if ddp_active else model
@@ -584,18 +727,14 @@ for step in range(train_steps + 1):
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
 
+        val_steps = math.ceil(float(args.val_tokens) / args.train_seq_len)
+        print0(f"Running validation ({val_steps} steps).", console=True)
         model.eval()
-        val_loader = data_handler.get_validation_data_generator(current_chunk_size)
+        val_loader = data_handler.get_validation_data_generator()
         val_loss = 0
         val_count = 0
 
-        # Reset model state before validation
-        #model.reset_state()
-
         with torch.no_grad():
-            # TODO: remove the cap
-            cap = 10
-            ct = 0
             for inputs, targets in val_loader:
                 model.reset_state()
                 inputs_list = inputs.cpu().tolist()
@@ -603,9 +742,8 @@ for step in range(train_steps + 1):
                 loss = training_helper.val_step(inputs_list, targets_list, step, train_steps)
                 val_loss += loss
                 val_count += 1
-                ct += 1
-                if ct >= cap:
-                    break
+                print(".", end='', flush=True)
+                print0(f"########## VALIDATION STEP {val_count} of {val_steps} COMPLETE ##########")
 
         if val_count > 0:
             val_loss /= val_count
@@ -617,6 +755,7 @@ for step in range(train_steps + 1):
         dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.AVG)
         val_loss = val_loss_tensor.item()
 
+        print0("\nValidation complete.", console=True)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} chunk_size:{current_chunk_size} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms", console=True)
 
         model.train()
@@ -638,9 +777,6 @@ for step in range(train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
-    # Get training data
-    train_loader = data_handler.get_training_data_generator(current_chunk_size)
-
     # Zero gradients once before accumulation
     model.zero_grad(set_to_none=True)  # Moved here
 
@@ -691,6 +827,84 @@ for step in range(train_steps + 1):
             if param.grad is not None:
                 dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
 
+    # --- START GRADIENT NORM LOGGING (for step % log_every_n_steps == 0) ---
+    if master_process and (step + 1) % 10 == 0:  # Log every 10 steps, or adjust frequency
+        print0(f"--- Grad Norms for Step {step + 1} ---")
+        # Access the underlying model if DDP is active
+        model_to_inspect = model.module if ddp_active else model
+
+        # 1. Initial Memory Parameters
+        if hasattr(model_to_inspect, 'initial_fwd_params') and model_to_inspect.initial_fwd_params:
+            for i, param in enumerate(model_to_inspect.initial_fwd_params):
+                if param.grad is not None:
+                    print0(f"  initial_fwd_params[{i}]: {param.grad.norm().item():.4e}")
+                else:
+                    print0(f"  initial_fwd_params[{i}]: No Grad")
+        if hasattr(model_to_inspect,
+                   'initial_rev_s_params') and model_to_inspect.initial_rev_s_params:  # For completeness
+            for i, param in enumerate(model_to_inspect.initial_rev_s_params):
+                if param.grad is not None:
+                    print0(f"  initial_rev_s_params[{i}]: {param.grad.norm().item():.4e}")
+                else:
+                    print0(f"  initial_rev_s_params[{i}]: No Grad")
+        if hasattr(model_to_inspect, 'initial_rev_p_params') and model_to_inspect.initial_rev_p_params:
+            for i, param in enumerate(model_to_inspect.initial_rev_p_params):
+                if param.grad is not None:
+                    print0(f"  initial_rev_p_params[{i}]: {param.grad.norm().item():.4e}")
+                else:
+                    print0(f"  initial_rev_p_params[{i}]: No Grad")
+
+        # 2. CascadeMemoryAttention Layer Parameters (iterate through layers)
+        for layer_idx, block in enumerate(model_to_inspect.layers):
+            if hasattr(block, 'attn') and isinstance(block.attn, CascadeMemoryAttention):
+                # Attention Gating Proj
+                if block.attn.gate_proj.weight.grad is not None:
+                    print0(f"  Layer {layer_idx} AttnGate W: {block.attn.gate_proj.weight.grad.norm().item():.4e}")
+                if block.attn.gate_proj.bias.grad is not None:
+                    print0(f"  Layer {layer_idx} AttnGate B: {block.attn.gate_proj.bias.grad.norm().item():.4e}")
+
+                # Memory Update Components (if they exist on this layer instance)
+                if block.attn.is_memory_update:
+                    # Forward Memory Update Gate
+                    if hasattr(block.attn,
+                               'fwd_memory_gate_proj') and block.attn.fwd_memory_gate_proj.weight.grad is not None:
+                        print0(
+                            f"  Layer {layer_idx} FwdMemUpdGate W: {block.attn.fwd_memory_gate_proj.weight.grad.norm().item():.4e}")
+
+                    # Reverse Memory Update Gate
+                    if hasattr(block.attn,
+                               'rev_memory_gate_proj') and block.attn.rev_memory_gate_proj.weight.grad is not None:
+                        print0(
+                            f"  Layer {layer_idx} RevMemUpdGate W: {block.attn.rev_memory_gate_proj.weight.grad.norm().item():.4e}")
+
+                    # QKV for Forward Memory Update
+                    if hasattr(block.attn,
+                               'fwd_memory_q_proj') and block.attn.fwd_memory_q_proj.weight.grad is not None:
+                        print0(
+                            f"  Layer {layer_idx} FwdMemUpd_Q W: {block.attn.fwd_memory_q_proj.weight.grad.norm().item():.4e}")
+                    if hasattr(block.attn,
+                               'fwd_memory_k_proj') and block.attn.fwd_memory_k_proj.weight.grad is not None:
+                        print0(
+                            f"  Layer {layer_idx} FwdMemUpd_K W: {block.attn.fwd_memory_k_proj.weight.grad.norm().item():.4e}")
+                    if hasattr(block.attn,
+                               'fwd_memory_v_proj') and block.attn.fwd_memory_v_proj.weight.grad is not None:
+                        print0(
+                            f"  Layer {layer_idx} FwdMemUpd_V W: {block.attn.fwd_memory_v_proj.weight.grad.norm().item():.4e}")
+
+                    # QKV for Reverse Memory Update (shared)
+                    if hasattr(block.attn,
+                               'rev_memory_q_proj') and block.attn.rev_memory_q_proj.weight.grad is not None:
+                        print0(
+                            f"  Layer {layer_idx} RevMemUpd_Q W: {block.attn.rev_memory_q_proj.weight.grad.norm().item():.4e}")
+                    # ... K and V for reverse, if you want to be exhaustive, but Q is indicative
+
+            # You could also log norms for block.mlp if desired
+            # if block.mlp[0].weight.grad is not None: # First linear layer of MLP
+            #     print0(f"  Layer {layer_idx} MLP1 W: {block.mlp[0].weight.grad.norm().item():.4e}")
+
+        print0(f"--- End Grad Norms for Step {step + 1} ---")
+    # --- END GRADIENT NORM LOGGING ---
+
     # Set learning rates
     for opt in optimizers:
         for group in opt.param_groups:
@@ -707,6 +921,7 @@ for step in range(train_steps + 1):
 
     # Logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
+    print0(f"########## TRAINING STEP {step + 1} of {train_steps} COMPLETE ##########")
     print0(f"step:{step + 1}/{train_steps} pred_loss:{avg_pred_loss_for_logging:.4f} total_loss:{avg_total_loss_for_logging:.4f} chunk_size:{current_chunk_size} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / (step + 1):.2f}ms", console=True)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "

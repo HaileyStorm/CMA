@@ -9,6 +9,12 @@ import yaml
 from torch import Tensor
 
 
+def print0(s, logfile):
+    #print(s, flush=True)
+    if logfile:
+        with open(logfile, "a") as f:
+            print(s, file=f, flush=True)
+
 @dataclass
 class CMAConfig:
     """Configuration for CMA model"""
@@ -50,12 +56,12 @@ class CMAConfig:
     ctrl_init_scale: float = 0.0001
 
     # Initialization
-    memory_init_scale: float = 0.02
-    gate_bias_init: float = -1.0
+    memory_init_scale: float = 0.01
+    gate_bias_init: float = 1.0
     output_proj_zero_init: bool = True
 
     # Adaptive gating regularization
-    gate_regularization_type: Optional[str] = None  # None, "l1", or "entropy"
+    gate_regularization_type: Optional[str] = "l1"  # None, "l1", or "entropy"
     gate_regularization_strength: float = 0.001
 
     # Future‐masking schedule: progress breakpoints and rates
@@ -64,6 +70,7 @@ class CMAConfig:
     enable_mask_future_dropout: bool = True
 
     DEBUG_LEVEL: int = 0
+    logfile: str = None
 
     def __post_init__(self):
         if self.boundary_types is None:
@@ -81,7 +88,7 @@ class CMAConfig:
                     self.layer_structure.append({"type": "memory_update"})
                 else:
                     self.layer_structure.append({"type": "local_only"})
-            print("Warning: No layer_structure provided. Using default alternating structure.")
+            print0("Warning: No layer_structure provided. Using default alternating structure.", self.config.logfile)
 
         self.validate()
 
@@ -288,7 +295,7 @@ class ChunkProcessor:
 
             # Prevent fallback loop: if fallback used the same start_pos last time, force progress
             if est_start == last_successful_start_pos:
-                 if self.config.DEBUG_LEVEL > 0: print(f"DEBUG: semantic_chunk - Fallback might loop. Forcing progress from end_pos {end_pos}")
+                 if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: semantic_chunk - Fallback might loop. Forcing progress from end_pos {end_pos}", self.config.logfile)
                  start_pos = max(0, end_pos - 1) # Take at least one char
                  chunk_text = text[start_pos:end_pos]
                  if chunk_text: # Ensure text exists
@@ -299,7 +306,7 @@ class ChunkProcessor:
                      if chunk_tokens: # Final check if tokens exist
                         chunks.insert(0, chunk_tokens)
                  else: # If text[end_pos-1:end_pos] is empty (e.g. multi-byte char issue?)
-                     print(f"WARN: semantic_chunk - Forced progress resulted in empty text slice.")
+                     print0(f"WARN: semantic_chunk - Forced progress resulted in empty text slice.", self.config.logfile)
                  end_pos = start_pos # Ensure outer loop makes progress
                  last_successful_start_pos = start_pos # Update last pos
                  continue # Skip normal inner loop/fallback
@@ -320,13 +327,13 @@ class ChunkProcessor:
                 if not chunk_text:
                     # Empty slice usually means start_pos >= end_pos
                     if start_pos == 0 and end_pos <=0 : # Check if we are truly at the beginning and done
-                         if self.config.DEBUG_LEVEL > 0: print("DEBUG: semantic_chunk - Empty chunk text at start_pos 0, terminating.")
+                         if self.config.DEBUG_LEVEL > 0: print0("DEBUG: semantic_chunk - Empty chunk text at start_pos 0, terminating.", self.config.logfile)
                          end_pos = 0
                          found_valid_chunk = True # Exit inner loop cleanly
                          continue # Go to outer loop check (will terminate)
                     else:
                         # Treat as overshoot signal if slice is empty unexpectedly mid-sequence
-                        if self.config.DEBUG_LEVEL > 0: print(f"DEBUG: semantic_chunk - Empty chunk text for start_pos {start_pos}, end_pos {end_pos}. Adjusting estimate.")
+                        if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: semantic_chunk - Empty chunk text for start_pos {start_pos}, end_pos {end_pos}. Adjusting estimate.", self.config.logfile)
                         # Need to move current_est_start *back* slightly to try and get content
                         current_est_start = max(0, start_pos - 10) # Move back 10 chars arbitrarily
                         iteration += 1
@@ -336,7 +343,7 @@ class ChunkProcessor:
 
                 # If encoding results in empty tokens (e.g., only whitespace removed by tokenizer)
                 if not chunk_tokens:
-                     if self.config.DEBUG_LEVEL > 0: print(f"DEBUG: semantic_chunk - Encoded tokens empty for text slice [{start_pos}:{end_pos}]. Adjusting estimate.")
+                     if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: semantic_chunk - Encoded tokens empty for text slice [{start_pos}:{end_pos}]. Adjusting estimate.", self.config.logfile)
                      current_est_start = max(0, start_pos - 10)
                      iteration += 1
                      continue # Retry inner loop
@@ -356,12 +363,12 @@ class ChunkProcessor:
                     # Adjust estimate forward based on the *current* failed start_pos
                     current_est_start = start_pos + int(excess_tokens * chars_per_token * 1.1) # Reduced buffer slightly
                     iteration += 1
-                    if self.config.DEBUG_LEVEL > 0: print(f"DEBUG: semantic_chunk - Overshot size ({len(chunk_tokens)} > {max_allowed_size}), retrying with est_start {current_est_start}")
+                    if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: semantic_chunk - Overshot size ({len(chunk_tokens)} > {max_allowed_size}), retrying with est_start {current_est_start}", self.config.logfile)
 
 
             # Fallback if inner loop exhausted iterations
             if not found_valid_chunk and end_pos > 0:
-                if self.config.DEBUG_LEVEL > 0: print(f"DEBUG: semantic_chunk - Fallback after {max_iterations} iterations for end_pos {end_pos}")
+                if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: semantic_chunk - Fallback after {max_iterations} iterations for end_pos {end_pos}", self.config.logfile)
                 # Use the original estimate for this outer loop pass
                 start_pos = est_start
                 # --- Prevent start_pos from exceeding end_pos in fallback ---
@@ -373,15 +380,15 @@ class ChunkProcessor:
                     chunk_tokens = self.tokenizer.encode(chunk_text)
                     max_allowed_size = current_target_size
                     if len(chunk_tokens) > max_allowed_size:
-                        if self.config.DEBUG_LEVEL > 0: print(f"DEBUG: semantic_chunk - Truncating fallback chunk ({len(chunk_tokens)} > {max_allowed_size})")
+                        if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: semantic_chunk - Truncating fallback chunk ({len(chunk_tokens)} > {max_allowed_size})", self.config.logfile)
                         chunk_tokens = chunk_tokens[:max_allowed_size]
 
                     if chunk_tokens:
                         chunks.insert(0, chunk_tokens)
                     else:
-                         print(f"WARN: semantic_chunk - Fallback resulted in empty tokens for slice [{start_pos}:{end_pos}]")
+                         print0(f"WARN: semantic_chunk - Fallback resulted in empty tokens for slice [{start_pos}:{end_pos}]", self.config.logfile)
                 else:
-                     print(f"WARN: semantic_chunk - Fallback resulted in empty text slice [{start_pos}:{end_pos}]")
+                     print0(f"WARN: semantic_chunk - Fallback resulted in empty text slice [{start_pos}:{end_pos}]", self.config.logfile)
 
 
                 # Update end_pos based on the start_pos used for the fallback chunk
