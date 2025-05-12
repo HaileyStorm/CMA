@@ -1,5 +1,6 @@
 import os
 import sys
+from typing import Union
 
 with open(sys.argv[0]) as f:
     code = f.read()  # read the code of this file ASAP, for logging
@@ -204,7 +205,7 @@ class CMADataHandler:
         files = [Path(file) for file in sorted(glob.glob(self.val_files))]
         val_batch_size = self.world_size * chunk_size * self.val_seq_len_multiplier
 
-        assert self.val_tokens % val_batch_size == 0
+        #assert self.val_tokens % val_batch_size == 0
         val_steps = self.val_tokens // val_batch_size
 
         file_iter = iter(files)
@@ -238,8 +239,8 @@ class CMATrainingHelper:
         self.ddp_active = ddp_active
         self.underlying_model = model.module if ddp_active else model
 
-    def train_step(self, inputs_token_ids: list, targets_token_ids: list, step: int, total_steps: int) -> tuple[
-        Tensor, Tensor]:
+    def train_step(self, inputs_token_ids: Union[list, torch.Tensor], targets_token_ids: Union[list, torch.Tensor],
+                   step: int, total_steps: int) -> tuple[Tensor, Tensor]:
         """
         Perform a single training step for CMA.
         inputs_token_ids: The full list of token IDs for the input sequence.
@@ -254,7 +255,9 @@ class CMATrainingHelper:
 
         # Logits from model.forward are now potentially concatenated from all Pass 2 chunks
         # Gate_loss is also aggregated from all Pass 2 chunks
+        print0("train_step running model forward...")
         logits, gate_loss = self.model(inputs_token_ids, training_mode=True)
+        print0("train_step model forward complete.")
 
         pred_loss_normalized = torch.tensor(0.0, device=logits.device)  # Match logits device
 
@@ -278,8 +281,7 @@ class CMATrainingHelper:
                 actual_targets_for_loss = targets_tensor[:num_predicted_tokens].contiguous()
             else:
                 # This case implies an issue, logits are longer than available original targets
-                print0(
-                    f"Warning: Logits length ({num_predicted_tokens}) > original targets length ({targets_tensor.numel()}). Truncating logits.")
+                print0(f"Warning: Logits length ({num_predicted_tokens}) > original targets length ({targets_tensor.numel()}). Truncating logits.")
                 logits = logits[:, :targets_tensor.numel(), :]
                 actual_targets_for_loss = targets_tensor.contiguous()
                 num_predicted_tokens = logits.size(1)  # Update to new length
@@ -300,14 +302,17 @@ class CMATrainingHelper:
 
         return total_loss, pred_loss_normalized
 
-    def val_step(self, inputs_token_ids: list, targets_token_ids: list, step: int, total_steps: int) -> float:
+    def val_step(self, inputs_token_ids: Union[list, torch.Tensor], targets_token_ids: Union[list, torch.Tensor], step: int, total_steps: int) -> float:
         self.model.eval()
         self.underlying_model.set_training_step(step, total_steps)
 
         val_loss_value = 0.0
         with torch.no_grad():
             # training_mode=False, gate_loss is ignored
+            #print(inputs_token_ids)
+            print0("val_step running model forward...")
             logits, _gate_loss_ignored = self.model(inputs_token_ids, training_mode=False)
+            print0("val_step model forward complete.")
 
             if logits.numel() > 0 and logits.size(1) > 0:
                 num_predicted_tokens = logits.size(1)
@@ -316,8 +321,7 @@ class CMATrainingHelper:
                 if targets_tensor.numel() >= num_predicted_tokens:
                     actual_targets_for_loss = targets_tensor[:num_predicted_tokens].contiguous()
                 else:
-                    print0(
-                        f"Warning (VAL): Logits length ({num_predicted_tokens}) > original targets length ({targets_tensor.numel()}). Truncating logits.")
+                    print0(f"Warning (VAL): Logits length ({num_predicted_tokens}) > original targets length ({targets_tensor.numel()}). Truncating logits.")
                     logits = logits[:, :targets_tensor.numel(), :]
                     actual_targets_for_loss = targets_tensor.contiguous()
                     num_predicted_tokens = logits.size(1)
@@ -339,6 +343,8 @@ class CMATrainingHelper:
 
 @dataclass
 class Hyperparameters:
+    DEBUG_LEVEL = 0  # 0=warnings/errors/etc. only, 1=debug, 2=info
+
     # data
     train_files = "data/fineweb10B/fineweb_train_*.bin"
     val_files = "data/fineweb10B/fineweb_val_*.bin"
@@ -347,15 +353,18 @@ class Hyperparameters:
     val_seq_len_multiplier = 8  # Validation sequences will be chunk_size * this
 
     # CMA specific
-    chunk_size = 768  # Will be progressively increased
-    max_memory_size = 3072
-    reverse_memory_size = 320
+    chunk_size_min = 256 #128 #256  # Chunk size starts here and...
+    chunk_size_max = 256 #768  # Will be progressively increased to this max
+    max_memory_size = 128 #3072
+    reverse_memory_size = 32 #320
+    memory_cap_length = 49152
 
     # model architecture  
     vocab_size = 50257
-    embed_dim = 768
-    n_heads = 6
-    n_layers = 12
+    embed_dim = 256 #768
+    n_heads = 4 #6
+    head_dim = 64 #128  # Typically embed_dim // n_heads
+    n_layers = 3 #12
 
     # optimization
     num_iterations = 1770
@@ -370,10 +379,20 @@ class Hyperparameters:
 args = Hyperparameters()
 
 # Setup distributed training
-rank = int(os.environ["RANK"])
-world_size = int(os.environ["WORLD_SIZE"])
+try:
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+except KeyError:
+    rank = 0
+    world_size = 1
+    device = torch.device("cuda", 0)
+    os.environ['RANK'] = '0'
+    os.environ['WORLD_SIZE'] = '1'
+    os.environ['LOCAL_RANK'] = '0'
+    os.environ['MASTER_ADDR'] = '127.0.0.1'
+    os.environ['MASTER_PORT'] = '8080'
 assert torch.cuda.is_available()
-device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
 dist.init_process_group(backend="nccl", device_id=device)
 dist.barrier()
@@ -391,13 +410,13 @@ if master_process:
 def print0(s, console=False):
     if master_process:
         with open(logfile, "a") as f:
-            if console:
+            if console or args.DEBUG_LEVEL > 0:
                 print(s)
             print(s, file=f)
 
 
 # Log initial information
-print0(code)
+#print0(code)
 print0("=" * 100)
 print0(f"Running Python {sys.version}")
 print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
@@ -405,11 +424,13 @@ print0("=" * 100)
 
 # Create CMA configuration
 config = CMAConfig(
-    chunk_size=args.chunk_size,  # This will be updated during training
+    chunk_size=args.chunk_size_max,  # This will be updated during training
     max_memory_size=args.max_memory_size,
+    memory_cap_length=args.memory_cap_length,
     reverse_memory_size=args.reverse_memory_size,
     embed_dim=args.embed_dim,
     n_heads=args.n_heads,
+    head_dim=args.head_dim,
     n_layers=args.n_layers,
     share_initial_memory=True,
     reset_memory_on_cycle=True,
@@ -418,9 +439,10 @@ config = CMAConfig(
     gate_regularization_strength=0.001,
     # Use simple layer structure for now
     layer_structure=[
-        {"type": "local_only"} if i % 5 != 4 else {"type": "memory_update"}
+        {"type": "local_only"} if i % 3 != 2 else {"type": "memory_update"}
         for i in range(args.n_layers)
-    ]
+    ],
+    DEBUG_LEVEL=args.DEBUG_LEVEL
 )
 
 # Create model
@@ -463,6 +485,7 @@ data_handler = CMADataHandler(
 # model.set_training_step(), model.reset_state() which are fine with DDP wrapper.
 # Let's adjust CMATrainingHelper to expect the potentially DDP-wrapped model and access .module if needed.
 training_helper = CMATrainingHelper(model, ddp_active)  # Pass model and ddp_active flag
+print0("Data handler and training helper create.")
 
 # Collect parameters for different optimizers
 hidden_matrix_params = []
@@ -498,13 +521,13 @@ adam_params_filtered = [pg for pg in adam_param_groups if pg['params']]
 
 
 optimizer1 = torch.optim.Adam(adam_params_filtered, betas=(0.8, 0.95), eps=1e-10, fused=True)
-# Muon optimizer for hidden_matrix_params (already collected correctly)
 optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size)
 optimizers = [optimizer1, optimizer2]
 
 for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
+print0(f"Optimizers created. Adam has {len(adam_params_filtered)} parameters, Muon has {len(hidden_matrix_params)} parameters.")
 
 
 # Learning rate schedule
@@ -520,17 +543,20 @@ def get_lr(step: int):
 
 # Curriculum learning: progressively increase chunk size
 def get_chunk_size(step: int):
-    x = step / args.num_iterations
+    return args.chunk_size_max
+    x = step / (args.num_iterations * 0.8)
     # Linearly increase from 256 to 768 tokens
-    min_chunk_size = 256
-    max_chunk_size = args.chunk_size
+    min_chunk_size = args.chunk_size_min
+    max_chunk_size = args.chunk_size_max
     current_size = int(min_chunk_size + x * (max_chunk_size - min_chunk_size))
     return min(current_size, max_chunk_size)
 
 
 # Compile model (if using PyTorch 2.0+)
+print0("Compiling model...")
 try:
     model = torch.compile(model, dynamic=False)
+    print0("Compile complete.")
 except:
     print0("Warning: torch.compile not available, running uncompiled model")
 
@@ -539,6 +565,7 @@ training_time_ms = 0
 torch.cuda.synchronize()
 t0 = time.perf_counter()
 
+print0("Starting main training loop.")
 train_steps = args.num_iterations
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
@@ -563,25 +590,34 @@ for step in range(train_steps + 1):
         val_count = 0
 
         # Reset model state before validation
-        model.reset_state()
+        #model.reset_state()
 
         with torch.no_grad():
+            # TODO: remove the cap
+            cap = 10
+            ct = 0
             for inputs, targets in val_loader:
-                loss = training_helper.val_step(inputs, targets, step, train_steps)
+                model.reset_state()
+                inputs_list = inputs.cpu().tolist()
+                targets_list = targets.cpu().tolist()
+                loss = training_helper.val_step(inputs_list, targets_list, step, train_steps)
                 val_loss += loss
                 val_count += 1
+                ct += 1
+                if ct >= cap:
+                    break
 
         if val_count > 0:
             val_loss /= val_count
+        else:
+            val_loss = 0.0
 
         # Properly handle distributed validation loss
         val_loss_tensor = torch.tensor(val_loss, device=device)
         dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.AVG)
         val_loss = val_loss_tensor.item()
 
-        print0(
-            f"step:{step}/{train_steps} val_loss:{val_loss:.4f} chunk_size:{current_chunk_size} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms",
-            console=True)
+        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} chunk_size:{current_chunk_size} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms", console=True)
 
         model.train()
 
@@ -623,8 +659,8 @@ for step in range(train_steps + 1):
         # inputs_for_model is seq[:-1], targets_for_loss_calc is seq[1:]
         # CMAModel.forward will use inputs_for_model.
         # CMATrainingHelper.train_step will use targets_for_loss_calc to align with returned logits.
-        inputs_for_model_list = raw_inputs_tensor.squeeze(0).cpu().tolist()
-        targets_for_loss_calc_list = raw_targets_tensor.squeeze(0).cpu().tolist()
+        inputs_for_model_list = raw_inputs_tensor.cpu().tolist()
+        targets_for_loss_calc_list = raw_targets_tensor.cpu().tolist()
 
         total_loss_tensor, pred_loss_normalized_tensor = training_helper.train_step(
             inputs_for_model_list,
@@ -671,9 +707,7 @@ for step in range(train_steps + 1):
 
     # Logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(
-        f"step:{step + 1}/{train_steps} pred_loss:{avg_pred_loss_for_logging:.4f} total_loss:{avg_total_loss_for_logging:.4f} chunk_size:{current_chunk_size} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / (step + 1):.2f}ms",
-        console=True)
+    print0(f"step:{step + 1}/{train_steps} pred_loss:{avg_pred_loss_for_logging:.4f} total_loss:{avg_total_loss_for_logging:.4f} chunk_size:{current_chunk_size} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / (step + 1):.2f}ms", console=True)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)

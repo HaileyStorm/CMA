@@ -619,7 +619,7 @@ class TestMemoryManager:
         print("\nTesting write mask progression...")
         B = 1 # Keep batch size simple for this test
         dev = get_device()
-        total_chunks_in_pass = 4 # Example number of chunks in a pass
+        total_chunks_in_pass = 80 # Example number of chunks in a pass
         tokens_per_chunk = basic_config.chunk_size # Use config chunk size
 
         results = []
@@ -634,7 +634,7 @@ class TestMemoryManager:
             tokens_before_chunk = tokens_processed_before_pass + (i * tokens_per_chunk)
 
             # Calculate the sequence-length based write cap
-            seq_cap = manager.get_effective_size(tokens_before_chunk)
+            seq_cap = manager.get_effective_size(tokens_before_chunk, tokens_per_chunk)
 
             # Calculate the target writable size based on chunk progress within the pass
             chunk_progress = (i + 1) / total_chunks_in_pass
@@ -650,6 +650,7 @@ class TestMemoryManager:
                 current_chunk_idx_in_pass=i,
                 total_chunks_in_pass=total_chunks_in_pass,
                 total_tokens_processed_before_chunk=tokens_before_chunk,
+                current_chunk_len=tokens_per_chunk,
                 batch_size=B,
                 device=dev
             )

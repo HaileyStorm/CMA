@@ -63,6 +63,8 @@ class CMAConfig:
     mask_future_rates: List[float] = field(default_factory=lambda: [0.333, 0.667, 1.0])
     enable_mask_future_dropout: bool = True
 
+    DEBUG_LEVEL: int = 0
+
     def __post_init__(self):
         if self.boundary_types is None:
             self.boundary_types = {
@@ -110,6 +112,7 @@ class CMAConfig:
         assert isinstance(self.enable_mask_future_dropout, bool)
         assert isinstance(self.mask_future_schedule, list) and len(self.mask_future_schedule) == 2
         assert isinstance(self.mask_future_rates, list) and len(self.mask_future_rates) == 3
+        assert 0 <= self.DEBUG_LEVEL <= 2
 
         # Layer structure validation is handled during model init parsing
         # because it needs the parsed structure itself. We could add config-level
@@ -285,7 +288,7 @@ class ChunkProcessor:
 
             # Prevent fallback loop: if fallback used the same start_pos last time, force progress
             if est_start == last_successful_start_pos:
-                 print(f"DEBUG: semantic_chunk - Fallback might loop. Forcing progress from end_pos {end_pos}")
+                 if self.config.DEBUG_LEVEL > 0: print(f"DEBUG: semantic_chunk - Fallback might loop. Forcing progress from end_pos {end_pos}")
                  start_pos = max(0, end_pos - 1) # Take at least one char
                  chunk_text = text[start_pos:end_pos]
                  if chunk_text: # Ensure text exists
@@ -317,13 +320,13 @@ class ChunkProcessor:
                 if not chunk_text:
                     # Empty slice usually means start_pos >= end_pos
                     if start_pos == 0 and end_pos <=0 : # Check if we are truly at the beginning and done
-                         print("DEBUG: semantic_chunk - Empty chunk text at start_pos 0, terminating.")
+                         if self.config.DEBUG_LEVEL > 0: print("DEBUG: semantic_chunk - Empty chunk text at start_pos 0, terminating.")
                          end_pos = 0
                          found_valid_chunk = True # Exit inner loop cleanly
                          continue # Go to outer loop check (will terminate)
                     else:
                         # Treat as overshoot signal if slice is empty unexpectedly mid-sequence
-                        print(f"DEBUG: semantic_chunk - Empty chunk text for start_pos {start_pos}, end_pos {end_pos}. Adjusting estimate.")
+                        if self.config.DEBUG_LEVEL > 0: print(f"DEBUG: semantic_chunk - Empty chunk text for start_pos {start_pos}, end_pos {end_pos}. Adjusting estimate.")
                         # Need to move current_est_start *back* slightly to try and get content
                         current_est_start = max(0, start_pos - 10) # Move back 10 chars arbitrarily
                         iteration += 1
@@ -333,7 +336,7 @@ class ChunkProcessor:
 
                 # If encoding results in empty tokens (e.g., only whitespace removed by tokenizer)
                 if not chunk_tokens:
-                     print(f"DEBUG: semantic_chunk - Encoded tokens empty for text slice [{start_pos}:{end_pos}]. Adjusting estimate.")
+                     if self.config.DEBUG_LEVEL > 0: print(f"DEBUG: semantic_chunk - Encoded tokens empty for text slice [{start_pos}:{end_pos}]. Adjusting estimate.")
                      current_est_start = max(0, start_pos - 10)
                      iteration += 1
                      continue # Retry inner loop
@@ -353,12 +356,12 @@ class ChunkProcessor:
                     # Adjust estimate forward based on the *current* failed start_pos
                     current_est_start = start_pos + int(excess_tokens * chars_per_token * 1.1) # Reduced buffer slightly
                     iteration += 1
-                    print(f"DEBUG: semantic_chunk - Overshot size ({len(chunk_tokens)} > {max_allowed_size}), retrying with est_start {current_est_start}")
+                    if self.config.DEBUG_LEVEL > 0: print(f"DEBUG: semantic_chunk - Overshot size ({len(chunk_tokens)} > {max_allowed_size}), retrying with est_start {current_est_start}")
 
 
             # Fallback if inner loop exhausted iterations
             if not found_valid_chunk and end_pos > 0:
-                print(f"DEBUG: semantic_chunk - Fallback after {max_iterations} iterations for end_pos {end_pos}")
+                if self.config.DEBUG_LEVEL > 0: print(f"DEBUG: semantic_chunk - Fallback after {max_iterations} iterations for end_pos {end_pos}")
                 # Use the original estimate for this outer loop pass
                 start_pos = est_start
                 # --- Prevent start_pos from exceeding end_pos in fallback ---
@@ -370,7 +373,7 @@ class ChunkProcessor:
                     chunk_tokens = self.tokenizer.encode(chunk_text)
                     max_allowed_size = current_target_size
                     if len(chunk_tokens) > max_allowed_size:
-                        print(f"DEBUG: semantic_chunk - Truncating fallback chunk ({len(chunk_tokens)} > {max_allowed_size})")
+                        if self.config.DEBUG_LEVEL > 0: print(f"DEBUG: semantic_chunk - Truncating fallback chunk ({len(chunk_tokens)} > {max_allowed_size})")
                         chunk_tokens = chunk_tokens[:max_allowed_size]
 
                     if chunk_tokens:
@@ -451,19 +454,34 @@ class MemoryManager:
     def __init__(self, config: CMAConfig):
         self.config = config
 
-    def get_effective_size(self, total_tokens_processed: int) -> int:
-        seq_len = total_tokens_processed
+    def get_effective_size(self, total_tokens_processed: int, current_chunk_length: int = 0) -> int:
+        seq_len_for_calc = total_tokens_processed
+
+        # If total_tokens_processed is 0, let effective_size be based on initial_write_fraction directly.
+        if total_tokens_processed == 0 and current_chunk_length > 0:
+            #seq_len_for_calc = max(1, int(self.config.memory_cap_length * 0.01))  # Allow 1% growth from start
+            seq_len_for_calc = max(1, int(self.config.chunk_size * self.config.initial_write_fraction))
+
         if self.config.memory_growth_function == "linear":
             cap_length = max(1, self.config.memory_cap_length)
-            fraction = min(1.0, seq_len / cap_length)
+            fraction = min(1.0, seq_len_for_calc / cap_length)
         elif self.config.memory_growth_function == "log":
-            if seq_len <= 1: fraction = 0.0
+            if seq_len_for_calc <= 1:
+                fraction = 0.0
             else:
                 cap_length = max(2, self.config.memory_cap_length)
-                fraction = math.log(seq_len) / math.log(cap_length)
+                fraction = math.log(seq_len_for_calc) / math.log(cap_length)
                 fraction = min(1.0, max(0.0, fraction))
-        else: raise ValueError(f"Unknown growth function: {self.config.memory_growth_function}")
+        else:
+            raise ValueError(f"Unknown growth function: {self.config.memory_growth_function}")
+
         effective_size = max(0, round(self.config.max_memory_size * fraction))
+
+        if total_tokens_processed == 0 and current_chunk_length > 0:
+            min_size_for_initial_write = round(self.config.max_memory_size * self.config.initial_write_fraction)
+            effective_size = max(effective_size, min_size_for_initial_write)
+            effective_size = min(effective_size, self.config.max_memory_size)
+
         return effective_size
 
     def get_write_mask(
@@ -471,18 +489,36 @@ class MemoryManager:
             current_chunk_idx_in_pass: int,
             total_chunks_in_pass: int,
             total_tokens_processed_before_chunk: int,
+            current_chunk_len: int,
             batch_size: int = 1,
             device: torch.device = torch.device('cpu')
     ) -> Tensor:
-        seq_write_cap = self.get_effective_size(total_tokens_processed_before_chunk)
+        # Effective size should consider up to the end of the current chunk for growth
+        # seq_write_cap = self.get_effective_size(total_tokens_processed_before_chunk + current_chunk_len)
+        # OR, more simply, ensure get_effective_size doesn't return 0 if current_chunk_len > 0
+        seq_write_cap = self.get_effective_size(total_tokens_processed_before_chunk,
+                                                current_chunk_length=current_chunk_len)
+
         if total_chunks_in_pass > 0:
             chunk_progress = (current_chunk_idx_in_pass + 1) / total_chunks_in_pass
             initial_fraction = self.config.initial_write_fraction
             write_fraction = initial_fraction + (1.0 - initial_fraction) * chunk_progress
-        else: write_fraction = self.config.initial_write_fraction
+        else:
+            write_fraction = self.config.initial_write_fraction
+
         target_writable_size = int(self.config.max_memory_size * write_fraction)
         writable_size = min(seq_write_cap, target_writable_size)
-        writable_size = max(0, writable_size)
+        writable_size = max(0, writable_size)  # Should be at least 0
+
+        # If total_tokens_processed_before_chunk is 0 and current_chunk_len > 0,
+        # ensure at least some minimal write if initial_write_fraction > 0
+        if total_tokens_processed_before_chunk == 0 and current_chunk_len > 0 and self.config.initial_write_fraction > 0:
+            min_write_for_first_chunk = max(1, round(
+                self.config.max_memory_size * self.config.initial_write_fraction * 0.1))  # e.g. 10% of initial fraction
+            # or just 1 token?
+            # writable_size = max(writable_size, min_write_for_first_chunk) # This might override seq_write_cap logic
+            # The fix in get_effective_size using current_chunk_length should be primary.
+
         mask = torch.zeros(batch_size, self.config.max_memory_size, dtype=torch.bool, device=device)
         if writable_size > 0: mask[:, :writable_size] = True
         return mask
