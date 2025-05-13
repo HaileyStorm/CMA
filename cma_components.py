@@ -20,7 +20,7 @@ class CMAConfig:
     """Configuration for CMA model"""
     # Chunking
     chunk_size: int = 768
-    semantic_chunking_gap_percentage: float = 25.0
+    semantic_chunking_gap_percentage: float = 18.0
     boundary_search_chars: List[int] = (256, 64, 32)
     boundary_types: Dict[str, List[str]] = None
     buffer_ratio: float = 0.1
@@ -28,7 +28,7 @@ class CMAConfig:
     # Memory
     max_memory_size: int = 3072
     reverse_memory_size: int = 320
-    initial_write_fraction: float = 0.6
+    initial_write_fraction: float = 0.5
     memory_growth_function: str = "linear"
     memory_cap_length: int = 49152
     share_initial_memory: bool = False
@@ -37,9 +37,9 @@ class CMAConfig:
     # Reverse pass
     reverse_max_chunks: int = 4
     lookahead_reverse_decay_step: float = 0.2
-    lookahead_reverse_decay_rate: float = 0.5
-    persistent_reverse_decay_step: float = 0.05
-    persistent_reverse_decay_rate: float = 0.1
+    lookahead_reverse_decay_rate: float = 0.6
+    persistent_reverse_decay_step: float = -0.333
+    persistent_reverse_decay_rate: float = -0.05
     persistent_reverse_update_freq_tokens: Optional[int] = None
     persistent_reverse_update_freq_semantic: Optional[str] = None # e.g. "secondary"
 
@@ -53,20 +53,20 @@ class CMAConfig:
 
     # Control tokens
     integration_method: str = "query_fusion"
-    ctrl_init_scale: float = 0.0001
+    ctrl_init_scale: float = 0.00008
 
     # Initialization
-    memory_init_scale: float = 0.01
-    gate_bias_init: float = 1.0
+    memory_init_scale: float = 0.005
+    gate_bias_init: float =1.0
     output_proj_zero_init: bool = True
 
     # Adaptive gating regularization
     gate_regularization_type: Optional[str] = "l1"  # None, "l1", or "entropy"
-    gate_regularization_strength: float = 0.001
+    gate_regularization_strength: float = 0.1
 
     # Future‐masking schedule: progress breakpoints and rates
     mask_future_schedule: List[float] = field(default_factory=lambda: [0.3, 0.7])
-    mask_future_rates: List[float] = field(default_factory=lambda: [0.333, 0.667, 1.0])
+    mask_future_rates: List[float] = field(default_factory=lambda: [0.75, 0.9, 1.0])
     enable_mask_future_dropout: bool = True
 
     DEBUG_LEVEL: int = 0
@@ -327,7 +327,7 @@ class ChunkProcessor:
                 if not chunk_text:
                     # Empty slice usually means start_pos >= end_pos
                     if start_pos == 0 and end_pos <=0 : # Check if we are truly at the beginning and done
-                         if self.config.DEBUG_LEVEL > 0: print0("DEBUG: semantic_chunk - Empty chunk text at start_pos 0, terminating.", self.config.logfile)
+                         #if self.config.DEBUG_LEVEL > 0: print0("DEBUG: semantic_chunk - Empty chunk text at start_pos 0, terminating.", self.config.logfile)
                          end_pos = 0
                          found_valid_chunk = True # Exit inner loop cleanly
                          continue # Go to outer loop check (will terminate)
@@ -564,9 +564,10 @@ class MemoryManager:
         # Index 2 (third): weight rate^(step) * rate^(step) = rate^(2*step) ?
         # Let's use a simple exponential decay: decay_factor = decay_rate ** (reverse_chunk_index * decay_step)
         # Ensure rate and step are reasonable (e.g., rate <= 1)
-        decay_rate = min(1.0, max(0.0, decay_rate))
+        neg = decay_rate < 0.0
+        decay_rate = min(1.0, max(0.0, abs(decay_rate)))
         decay_factor = decay_rate ** (reverse_chunk_index * decay_step)
 
         # Create weights tensor
-        weights = torch.full(memory_shape, decay_factor, device=device)
+        weights = torch.full(memory_shape, -decay_factor if neg else decay_factor, device=device)
         return weights

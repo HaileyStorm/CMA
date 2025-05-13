@@ -270,9 +270,7 @@ class CascadeMemoryAttention(nn.Module):
 
         if self.config.DEBUG_LEVEL > 0:
             print0(
-                f"DEBUG CMA Layer {self.layer_idx} _apply_gate: gate_logits min/max/mean: {gate_logits.min().item()}, {gate_logits.max().item()}, {gate_logits.mean().item()}", self.config.logfile)
-            print0(
-                f"DEBUG CMA Layer {self.layer_idx} _apply_gate: g min/max/mean: {g.min().item()}, {g.max().item()}, {g.mean().item()}", self.config.logfile)
+                f"DEBUG CMA Layer {self.layer_idx} _apply_gate: gate_logits min/max/mean, g min/max/mean: {gate_logits.min().item()}, {gate_logits.max().item()}, {gate_logits.mean().item()}, {g.min().item()}, {g.max().item()}, {g.mean().item()}", self.config.logfile)
 
         Y = Y_chunk + g * Y_mem  # final fused output
 
@@ -284,7 +282,7 @@ class CascadeMemoryAttention(nn.Module):
             ent = -(g * torch.log(g + 1e-8) + (1 - g) * torch.log(1 - g + 1e-8))
             reg_loss = self.config.gate_regularization_strength * torch.mean(ent)
 
-        if self.config.DEBUG_LEVEL > 1 and reg_loss is not None: print0(f"DEBUG CMA Layer {self.layer_idx} _apply_gate: reg_loss: {reg_loss.item()}", self.config.logfile)
+        #if self.config.DEBUG_LEVEL > 1 and reg_loss is not None: print0(f"DEBUG CMA Layer {self.layer_idx} _apply_gate: reg_loss: {reg_loss.item()}", self.config.logfile)
 
         return Y, reg_loss
 
@@ -878,7 +876,7 @@ class CMAModel(nn.Module):
             num_new_tokens_for_this_call = len(new_tokens)
             if trigger_update_cycle:
                 if self.config.reset_memory_on_cycle:
-                    if self.config.DEBUG_LEVEL > 0: print0("DEBUG: Resetting memory states for update cycle.", self.config.logfile)
+                    #if self.config.DEBUG_LEVEL > 0: print0("DEBUG: Resetting memory states for update cycle.", self.config.logfile)
                     self._initialize_memory_states(force_reset=True)
 
                 if input_processing_mode != "caller_exact":  # Re-chunk if not pre-chunked
@@ -974,6 +972,19 @@ class CMAModel(nn.Module):
                   self.config.logfile)
             final_logits = torch.zeros(1, 0, self.vocab_size, device=dev)
             # final_gate_loss might also be None here, which is acceptable if logits are empty.
+
+        if self.training:
+            # Existing slicing logic for cycle or no-cycle path leads to final_logits
+            if self.config.DEBUG_LEVEL > 0 and self.training_step < 5:  # Assuming 'step' is available or use self.training_step
+                expected_len = num_new_tokens_for_this_call  # This was len(new_tokens)
+                if final_logits.shape[1] != expected_len:
+                    print0(
+                        f"DEBUG CMAModel.forward (TRAIN): Step {self.training_step}, MISMATCH final_logits len {final_logits.shape[1]} vs expected new_tokens len {expected_len}. Input new_tokens len was {len(new_tokens)}. Cycle was {trigger_update_cycle}.",
+                        logfile=self.config.logfile)
+                else:
+                    print0(
+                        f"DEBUG CMAModel.forward (TRAIN): Step {self.training_step}, OK final_logits len {final_logits.shape[1]} == expected new_tokens len {expected_len}. Cycle was {trigger_update_cycle}.",
+                        logfile=self.config.logfile)
 
         # final_gate_loss is now the aggregated gate loss from the relevant path
         # (either cycle Pass 2 if training, or _process_current_chunk if training and no cycle)
@@ -1166,7 +1177,9 @@ class CMAModel(nn.Module):
                 if updated_fwd is not None:
                     g_id, mem = updated_fwd
                     self.M_fwd[g_id] = mem  # Update self.M_fwd directly
-                    if layer_idx == group.memory_update_layer_idx and chunk_idx == 0:  # Log for first chunk, after update
+                    if layer_idx == group.memory_update_layer_idx and \
+                            (chunk_idx == 0 or chunk_idx == len(chunks) - 1) and \
+                            self.config.DEBUG_LEVEL > 1:
                         self._print_memory_stats({g_id: mem}, f"Forward (Updated by L{layer_idx})", chunk_idx=chunk_idx)
 
                 if layer_gate_loss is not None:
@@ -1291,18 +1304,17 @@ class CMAModel(nn.Module):
     def _run_lookahead_reverse_pass(self, all_chunks: List[List[int]], B: int, dev: torch.device) -> Dict[int, Tensor]:
         try:
             """ Runs the lookahead reverse pass. """
-            if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: Entering _run_lookahead_reverse_pass", self.config.logfile)
-
             n_chunks = len(all_chunks)
             window_start_idx = max(0, n_chunks - self.config.reverse_max_chunks)
             reverse_window_chunks = all_chunks[window_start_idx:]
             window_size = len(reverse_window_chunks)
 
-            if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: n_chunks={n_chunks}, window_size={window_size}", self.config.logfile)
+            if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: Entering _run_lookahead_reverse_pass. n_chunks={n_chunks}, window_size={window_size}", self.config.logfile)
 
             # Check if we're dealing with large chunks
             for i, chunk in enumerate(reverse_window_chunks):
-                if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: Chunk {i} size: {len(chunk)}", self.config.logfile)
+                #if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: Chunk {i} size: {len(chunk)}", self.config.logfile)
+                pass
 
             # Initialize M_rev_ahead for this pass locally
             current_M_rev_ahead: Dict[int, Tensor] = {}
@@ -1310,13 +1322,13 @@ class CMAModel(nn.Module):
                 if group.has_memory:
                     group_idx = group.group_idx
                     mem_idx = self.group_id_to_memory_idx[group_idx]
-                    if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: Initializing memory for group {group_idx}", self.config.logfile)
+                    #if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: Initializing memory for group {group_idx}", self.config.logfile)
 
                     param = self.initial_rev_s_params[mem_idx]
-                    if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: Parameter shape: {param.shape}, device: {param.device}", self.config.logfile)
+                    #if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: Parameter shape: {param.shape}, device: {param.device}", self.config.logfile)
 
                     current_M_rev_ahead[group_idx] = param.clone().to(dev).repeat(B, 1, 1)
-                    if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: Initialized memory for group {group_idx}, shape: {current_M_rev_ahead[group_idx].shape}", self.config.logfile)
+                    #if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: Initialized memory for group {group_idx}, shape: {current_M_rev_ahead[group_idx].shape}", self.config.logfile)
             for i, chunk_tokens in enumerate(reversed(reverse_window_chunks)):
                 if not chunk_tokens:
                     if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: Skipping empty chunk at index {i}", self.config.logfile)
@@ -1325,12 +1337,12 @@ class CMAModel(nn.Module):
                 if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: Processing chunk {i} with {len(chunk_tokens)} tokens", self.config.logfile)
 
                 chunk_tensor = torch.tensor(chunk_tokens, dtype=torch.long, device=dev).unsqueeze(0)
-                if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: Created chunk tensor with shape {chunk_tensor.shape}", self.config.logfile)
+                #if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: Created chunk tensor with shape {chunk_tensor.shape}", self.config.logfile)
 
                 # Check if embedding lookup could be the issue
                 try:
                     x = self.token_embedding(chunk_tensor)
-                    if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: Embedded chunk shape: {x.shape}", self.config.logfile)
+                    #if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: Embedded chunk shape: {x.shape}", self.config.logfile)
                 except Exception as e:
                     print0(f"ERROR: Embedding lookup failed: {e}", self.config.logfile)
                     exit(3)
@@ -1419,7 +1431,7 @@ class CMAModel(nn.Module):
         current_M_rev_persist: Dict[int, Tensor] = {}
         for group in self.layer_groups:
             if group.has_memory:
-                group_idx = group.group_idx;
+                group_idx = group.group_idx
                 mem_idx = self.group_id_to_memory_idx[group_idx]
                 # Start from the learned initial state for this pass
                 current_M_rev_persist[group_idx] = self.initial_rev_p_params[mem_idx].clone().to(dev).repeat(B, 1, 1)
