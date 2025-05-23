@@ -184,14 +184,13 @@ class CMADataHandler:
             current_mult = min(
                 args.seq_final_mult,
                 args.seq_init_mult + (args.seq_final_mult - args.seq_init_mult) *
-                ((self.current_step) / (((args.seq_ramp_frac * args.num_iterations) / max(1, (
+                ((self.current_step) / (((args.seq_ramp_frac * args.num_iterations) / max(1.0, (
                             args.seq_final_mult - args.seq_init_mult))) * args.gradient_accumulation_steps))
             )
-            current_mult = int(math.floor(current_mult))
-            current_mult = max(1, current_mult)  # Ensure multiplier is at least 1
+            current_mult = max(1.0, current_mult)
 
             # Calculate target sequence length (this is per rank)
-            target_seq_len_for_inputs = args.base_seq_len * current_mult
+            target_seq_len_for_inputs = int(round(args.base_seq_len * current_mult))
 
             # Randomly reduce sequence length based on probability
             if random.random() < args.seq_short_prob:
@@ -486,8 +485,8 @@ class Hyperparameters:
 
     # Sequence length curriculum parameters
     base_seq_len = 512  # Base sequence length
-    seq_init_mult = 8  # Initial sequence length multiplier
-    seq_final_mult = 20  # Final sequence length multiplier
+    seq_init_mult = 8.0  # Initial sequence length multiplier
+    seq_final_mult = 20.0  # Final sequence length multiplier
     seq_ramp_frac = 0.5  # Fraction of total steps to reach final multiplier
     seq_short_prob = 0.5  # Probability of using shorter sequence
     seq_var_factor = 0.1  # Max reduction factor for shorter sequences
@@ -958,7 +957,7 @@ for step in range(train_steps + 1):
         # Calculate current sequence length for validation based on training curriculum
         # Ensure seq_final_mult - seq_init_mult is not zero for division
         seq_mult_diff = args.seq_final_mult - args.seq_init_mult
-        ramp_denominator_inv_steps = ((args.seq_ramp_frac * args.num_iterations) / max(1, seq_mult_diff)) * args.gradient_accumulation_steps
+        ramp_denominator_inv_steps = ((args.seq_ramp_frac * args.num_iterations) / max(1.0, seq_mult_diff)) * args.gradient_accumulation_steps
 
         current_mult_val = args.seq_init_mult
         if ramp_denominator_inv_steps > 0:  # Avoid division by zero if ramp_steps or grad_accum_steps is 0
@@ -967,10 +966,9 @@ for step in range(train_steps + 1):
                 args.seq_final_mult,
                 args.seq_init_mult + seq_mult_diff * progression
             )
-        current_mult_val = int(math.floor(current_mult_val))
-        current_mult_val = max(1, current_mult_val)  # Ensure multiplier is at least 1
+        current_mult_val = max(1.0, current_mult_val)
 
-        current_eval_seq_len = args.base_seq_len * current_mult_val
+        current_eval_seq_len = int(round(args.base_seq_len * current_mult_val))
         # Ensure it's at least a minimum practical length, e.g., smallest chunk size or base_seq_len
         current_eval_seq_len = max(current_eval_seq_len, args.base_seq_len, args.chunk_size_min)
 
