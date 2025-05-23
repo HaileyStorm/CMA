@@ -53,21 +53,26 @@ class CMAConfig:
 
     # Control tokens
     integration_method: str = "query_fusion"
-    ctrl_init_scale: float = 0.00008
+    ctrl_init_scale: float = 0.5
 
     # Initialization
-    memory_init_scale: float = 0.005
-    gate_bias_init: float =1.0
+    memory_init_scale: float = 0.05
+    gate_bias_init: float = 1.0
     output_proj_zero_init: bool = True
 
     # Adaptive gating regularization
-    gate_regularization_type: Optional[str] = "l1"  # None, "l1", or "entropy"
-    gate_regularization_strength: float = 0.1
+    gate_regularization_type: Optional[str] = "entropy"  # None, "l1", or "entropy"
+    gate_regularization_strength: float = 0.01
+    gate_saturation_penalty: bool = False
 
     # Future‐masking schedule: progress breakpoints and rates
-    mask_future_schedule: List[float] = field(default_factory=lambda: [0.3, 0.7])
-    mask_future_rates: List[float] = field(default_factory=lambda: [0.75, 0.9, 1.0])
     enable_mask_future_dropout: bool = True
+    mask_future_schedule: List[float] = field(default_factory=lambda: [0.3, 0.7])
+    mask_future_rates: List[float] = field(default_factory=lambda: [0.6, 0.85, 1.0])
+
+    # Canon micro-convolutional layers
+    enable_canon: bool = True
+    canon_kernel_size: int = 4
 
     DEBUG_LEVEL: int = 0
     logfile: str = None
@@ -500,6 +505,13 @@ class MemoryManager:
             batch_size: int = 1,
             device: torch.device = torch.device('cpu')
     ) -> Tensor:
+        if self.config.DEBUG_LEVEL > 0:
+            print0(
+                f"DEBUG get_write_mask INPUTS: total_tokens_processed_before_chunk={total_tokens_processed_before_chunk}, "
+                f"current_chunk_len={current_chunk_len}, current_chunk_idx_in_pass={current_chunk_idx_in_pass}, "
+                f"total_chunks_in_pass={total_chunks_in_pass}", self.config.logfile)
+
+
         # Effective size should consider up to the end of the current chunk for growth
         # seq_write_cap = self.get_effective_size(total_tokens_processed_before_chunk + current_chunk_len)
         # OR, more simply, ensure get_effective_size doesn't return 0 if current_chunk_len > 0
@@ -528,6 +540,12 @@ class MemoryManager:
 
         mask = torch.zeros(batch_size, self.config.max_memory_size, dtype=torch.bool, device=device)
         if writable_size > 0: mask[:, :writable_size] = True
+
+        if self.config.DEBUG_LEVEL > 0:
+            print0(f"DEBUG get_write_mask OUTPUTS: seq_write_cap={seq_write_cap}, "
+                   f"target_writable_size={target_writable_size}, writable_size={writable_size}, "
+                   f"mask_true_count={mask.sum().item()}", self.config.logfile)
+
         return mask
 
     def calculate_reverse_decay_weights(

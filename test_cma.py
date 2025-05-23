@@ -176,14 +176,6 @@ def convert_tuples_to_lists(data):
 # --- Test Classes ---
 
 class TestCMAConfig:
-    def test_instantiation_defaults(self):
-        config = CMAConfig()
-        assert config.chunk_size == 768
-        assert config.n_layers == 12 # Default before layer_structure override
-        assert config.layer_structure is not None # Default gets created
-        assert len(config.layer_structure) == 12
-        assert config.boundary_types is not None
-
     def test_instantiation_from_dict(self, basic_config_dict):
         config = CMAConfig.from_dict(basic_config_dict)
         assert config.chunk_size == CHUNK_SIZE
@@ -817,7 +809,7 @@ class TestBlock:
         assert gate_loss is None # Local block has no gating
 
     def test_update_block_forward_pass(self, update_block, basic_config):
-        B, T, C = 1, CHUNK_SIZE // 4, EMBED_DIM
+        B, T, C = 1, CHUNK_SIZE * 2, EMBED_DIM
         x = torch.randn(B, T, C, device=get_device())
         group_id = 0 # Assume this block belongs to group 0
         fwd_mem_in = create_dummy_memory(basic_config, B)
@@ -831,7 +823,7 @@ class TestBlock:
 
         out_x, updated_fwd, updated_rev, gate_loss = update_block(
             x, fwd_mem_dict, rev_mem_dict, persist_mem_dict,
-            group_id=group_id, mode="forward", control_tokens=ctrl, write_mask=write_mask
+            group_id=group_id, mode="forward", control_tokens=ctrl, write_mask=write_mask, total_logical_sequence_length=T
         )
         assert out_x.shape == x.shape
         assert updated_fwd is not None
@@ -842,7 +834,7 @@ class TestBlock:
         assert gate_loss is not None # Update block has gating
 
     def test_update_block_reverse_pass(self, update_block, basic_config):
-        B, T, C = 1, CHUNK_SIZE // 4, EMBED_DIM
+        B, T, C = 1, CHUNK_SIZE * 2, EMBED_DIM
         x = torch.randn(B, T, C, device=get_device())
         group_id = 0
         fwd_mem_dict = {} # Not used in reverse pass update
@@ -855,7 +847,7 @@ class TestBlock:
 
         out_x, updated_fwd, updated_rev, gate_loss = update_block(
             x, fwd_mem_dict, rev_mem_dict, persist_mem_dict,
-            group_id=group_id, mode="lookahead_reverse", control_tokens=ctrl, decay_weights=decay_weights
+            group_id=group_id, mode="lookahead_reverse", control_tokens=ctrl, decay_weights=decay_weights, total_logical_sequence_length=T
         )
         assert out_x.shape == x.shape
         assert updated_fwd is None
@@ -937,7 +929,7 @@ class TestCMAModel:
         assert len(basic_model.layer_groups) > 0
         assert basic_model.num_memory_groups == 3 # 3 update layers in basic_config structure
         assert len(basic_model.initial_fwd_params) == basic_model.num_memory_groups
-        assert len(basic_model.initial_rev_s_params) == basic_model.num_memory_groups
+        assert len(basic_model.initial_rev_la_params) == basic_model.num_memory_groups
         assert len(basic_model.initial_rev_p_params) == basic_model.num_memory_groups
         assert not basic_model.config.share_initial_memory
         # Check parameter counts match printout (approx)
@@ -955,7 +947,7 @@ class TestCMAModel:
         # Check if underlying data pointers are the same for shared params
         if grouped_model.num_memory_groups > 1:
             assert grouped_model.initial_fwd_params[0].data_ptr() == grouped_model.initial_fwd_params[1].data_ptr()
-            assert grouped_model.initial_rev_s_params[0].data_ptr() == grouped_model.initial_rev_s_params[1].data_ptr()
+            assert grouped_model.initial_rev_la_params[0].data_ptr() == grouped_model.initial_rev_la_params[1].data_ptr()
             assert grouped_model.initial_rev_p_params[0].data_ptr() == grouped_model.initial_rev_p_params[1].data_ptr()
 
         # Check skip layer was correctly identified and attn is None

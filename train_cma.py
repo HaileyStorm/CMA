@@ -1,5 +1,6 @@
 import math
 import os
+import random
 import sys
 from typing import Union
 
@@ -23,7 +24,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torch._inductor.config as inductor_config
 
 # Import CMA model
-from cma_model import CMAModel, CascadeMemoryAttention
+from cma_model import CMAModel, CascadeMemoryAttention, CanonConv, CausalSelfAttention
 from cma_components import CMAConfig
 
 
@@ -73,7 +74,7 @@ class Muon(torch.optim.Optimizer):
 
     Some warnings:
     - This optimizer should not be used for the embedding layer, the final fully connected layer,
-    or any {0,1}-D parameters; those should all be optimized by a standard method (e.g., AdamW).
+    or any {0,1}-D parameters; those should all be optimized by a standard method (e.g., Adam).
     - To use it with 4D convolutional filters, it works well to just flatten their last 3 dimensions.
 
     Arguments:
@@ -116,14 +117,16 @@ class Muon(torch.optim.Optimizer):
                 if base_i + self.rank < len(params):
                     p = params[base_i + self.rank]
                     g = p.grad
-                    assert g is not None
-                    state = self.state[p]
-                    if "momentum_buffer" not in state:
-                        state["momentum_buffer"] = torch.zeros_like(g)
-                    buf: Tensor = state["momentum_buffer"]
-                    buf.lerp_(g, 1 - group["momentum"])
-                    g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
-                    g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"]).flatten()
+                    if g is None:
+                        g = update_buffer_views[self.rank]
+                    else:
+                        state = self.state[p]
+                        if "momentum_buffer" not in state:
+                            state["momentum_buffer"] = torch.zeros_like(g)
+                        buf: Tensor = state["momentum_buffer"]
+                        buf.lerp_(g, 1 - group["momentum"])
+                        g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
+                        g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"]).flatten()
                 else:
                     g = update_buffer_views[self.rank]
                 if base_i > 0:
@@ -147,10 +150,9 @@ class CMADataHandler:
         self.rank = rank
         self.world_size = world_size
 
-
-        # For CMA, we don't use batch sequences like GPT, we process one sequence at a time
+        self.current_step = 0
+        # TODO: make bigger batches possible
         self.batch_size = 1
-
         self.chunk_size = 0
 
     def set_chunk_size(self, chunk_size: int):
@@ -169,71 +171,186 @@ class CMADataHandler:
         return tokens
 
     def get_training_data_generator(self):
-        """Generate training data in chunks for CMA processing"""
+        """Generate training data in chunks for CMA processing, distributed correctly."""
         files = [Path(file) for file in sorted(glob.glob(self.train_files))]
+        if not files:
+            raise ValueError(f"No training files found matching pattern: {self.train_files}")
         file_iter = iter(files)
         tokens, pos = self._load_data_shard(next(file_iter)), 0
 
         while True:
-            # For training, we need sequences longer than chunk_size to allow full update cycles
-            min_seq_len = self.train_tokens #chunk_size * self.train_seq_len_multiplier
-            max_seq_len = self.train_tokens #chunk_size * (self.train_seq_len_multiplier * 2)
+            # Calculate current sequence multiplier (discrete steps)
+            # This uses self.current_step, which is updated by data_handler.update_step(step) from main loop
+            current_mult = min(
+                args.seq_final_mult,
+                args.seq_init_mult + (args.seq_final_mult - args.seq_init_mult) *
+                ((self.current_step) / (((args.seq_ramp_frac * args.num_iterations) / max(1, (
+                            args.seq_final_mult - args.seq_init_mult))) * args.gradient_accumulation_steps))
+            )
+            current_mult = int(math.floor(current_mult))
+            current_mult = max(1, current_mult)  # Ensure multiplier is at least 1
 
-            # Check if we need to load next shard
-            if pos + min_seq_len >= len(tokens):
+            # Calculate target sequence length (this is per rank)
+            target_seq_len_for_inputs = args.base_seq_len * current_mult
+
+            # Randomly reduce sequence length based on probability
+            if random.random() < args.seq_short_prob:
+                reduction = random.random() * args.seq_var_factor
+                target_seq_len_for_inputs = int(target_seq_len_for_inputs * (1 - reduction))
+
+            target_seq_len_for_inputs = max(1, target_seq_len_for_inputs)  # Ensure at least 1 token for input
+
+            # tokens_per_rank_for_seq includes +1 for the target token
+            tokens_per_rank_for_seq = target_seq_len_for_inputs + 1
+
+            # Check if we need to load next shard (considering data for all ranks)
+            tokens_needed_for_batch_across_ranks = tokens_per_rank_for_seq * self.world_size
+
+            if pos + tokens_needed_for_batch_across_ranks > len(tokens):
                 try:
                     tokens, pos = self._load_data_shard(next(file_iter)), 0
                 except StopIteration:
-                    if master_process:  # Optional: Log epoch completion/restart
-                        print0(f"Data loader: Reached end of training files, restarting.", console=True)
-                    file_iter = iter(files)  # Restart from beginning
+                    if self.rank == 0:  # Use self.rank for messages within class
+                        print0(f"Data loader (Train): Reached end of training files, restarting.", console=True)
+                    file_iter = iter(files)
                     tokens, pos = self._load_data_shard(next(file_iter)), 0
 
-            # Get a sequence that's at least min_seq_len
-            actual_seq_len = min(len(tokens) - pos, max_seq_len)
+                # If after reload, still not enough for one batch, means shard is too small
+                # This could lead to an error if not handled, or ranks getting different amounts of data.
+                # For robust handling, one might adjust target_seq_len_for_inputs here,
+                # but for now, we assume shards are large enough.
+                if pos + tokens_needed_for_batch_across_ranks > len(tokens) and self.rank == 0:
+                    print0(f"Warning (Train): Loaded new shard, but it's still too small "
+                           f"({len(tokens)} tokens) to satisfy current batch demand "
+                           f"({tokens_needed_for_batch_across_ranks} tokens). "
+                           f"Consider larger data shards or smaller sequence/batch sizes.", console=True)
+                    # To prevent crashing, we might have to skip or yield smaller sequences.
+                    # For now, this will likely lead to an out-of-bounds error if not enough.
+                    # A simple fix: if not enough, recalculate tokens_per_rank_for_seq based on what's available
+                    if len(tokens) < tokens_needed_for_batch_across_ranks:
+                        available_total_tokens = len(tokens) - pos
+                        tokens_per_rank_for_seq = available_total_tokens // self.world_size
+                        target_seq_len_for_inputs = max(0, tokens_per_rank_for_seq - 1)  # update for consistency
+                        if target_seq_len_for_inputs == 0:  # not enough for any sequence
+                            # print0("Train: Not enough data for even minimal sequence, trying next shard/restart", console=True)
+                            continue  # try to load another shard / restart file iteration
 
-            # Make sure we have at least min_seq_len tokens
-            if actual_seq_len < min_seq_len:
-                continue
+            # Extract sequence for the current rank
+            # Ensure slice indices are valid.
+            # `target_seq_len_for_inputs` is the length of the input part of the sequence.
+            # `tokens_per_rank_for_seq` = `target_seq_len_for_inputs` + 1.
 
-            # Extract sequence
-            seq = tokens[pos:pos + actual_seq_len]
+            rank_start_offset = pos + self.rank * tokens_per_rank_for_seq
+            rank_end_offset = rank_start_offset + tokens_per_rank_for_seq
 
-            # Send to device as int32 for input and int64 for targets
-            inputs = seq[:-1].to(dtype=torch.int32, device="cuda", non_blocking=True)
-            targets = seq[1:].to(dtype=torch.int64, device="cuda", non_blocking=True)
+            # Defensive check if a shard is too small for all ranks
+            if rank_end_offset > len(tokens) or rank_start_offset > len(tokens):
+                # This implies the shard is smaller than tokens_per_rank_for_seq * world_size even after load.
+                # This should ideally be caught by the check above and target_seq_len_for_inputs adjusted.
+                # If it still happens, it's safer to skip this iteration for all ranks.
+                # However, DDP requires all ranks to make similar progress.
+                # print0(f"Rank {self.rank} (Train): Data shortage. Skipping batch. Pos {pos}, Start {rank_start_offset}, End {rank_end_offset}, LenTokens {len(tokens)}, SeqLenInp {target_seq_len_for_inputs}", console=True)
+                # Advancing pos here might misalign ranks. Best to ensure target_seq_len_for_inputs is small enough.
+                # The adjustment above for `if len(tokens) < tokens_needed_for_batch_across_ranks:` should help.
+                # If target_seq_len_for_inputs became 0, we should skip this yield.
+                if target_seq_len_for_inputs == 0:
+                    pos += tokens_per_rank_for_seq * self.world_size  # still advance pos
+                    continue
 
-            pos += actual_seq_len
+            seq_for_rank = tokens[rank_start_offset:rank_end_offset]
+
+            inputs = seq_for_rank[:-1].to(dtype=torch.int32, device="cuda", non_blocking=True)
+            targets = seq_for_rank[1:].to(dtype=torch.int64, device="cuda", non_blocking=True)
+
+            # Advance global position by total tokens consumed by all ranks in this step
+            pos += tokens_per_rank_for_seq * self.world_size
             yield inputs, targets
 
-    def get_validation_data_generator(self):
-        """Generate validation data in chunks"""
+    def get_validation_data_generator(self, current_eval_seq_len: int):
+        """Generate validation data in chunks, distributed correctly, using provided sequence length."""
         files = [Path(file) for file in sorted(glob.glob(self.val_files))]
-        val_batch_size = self.world_size * self.train_tokens
+        if not files:
+            raise ValueError(f"No validation files found matching pattern: {self.val_files}")
 
-        #assert self.val_tokens % val_batch_size == 0
-        val_steps = math.ceil(float(self.val_tokens) / val_batch_size)
-        processed_tokens = 0
+        processed_tokens_count_total = 0  # Tracks total tokens processed across all ranks towards self.val_tokens
 
         file_iter = iter(files)
         tokens, pos = self._load_data_shard(next(file_iter)), 0
 
-        for _ in range(val_steps):
-            seq_len = min(self.train_tokens, self.val_tokens - processed_tokens)
-            # Check if we need to load next shard
-            if pos + seq_len + 1 >= len(tokens):
-                tokens, pos = self._load_data_shard(next(file_iter)), 0
+        while processed_tokens_count_total < self.val_tokens:
+            # Determine seq_len for this validation batch, per rank
+            # It's the current_eval_seq_len, unless we're at the end of val_tokens budget
+            remaining_total_val_tokens_budget = self.val_tokens - processed_tokens_count_total
 
-            # Extract validation sequence
-            seq = tokens[pos + self.rank * seq_len:pos + (self.rank + 1) * seq_len + 1]
+            # Max sequence length per rank for this step based on budget
+            # Ensure world_size is not zero to prevent division error, though it should be >= 1
+            max_seq_len_per_rank_from_budget = remaining_total_val_tokens_budget // max(1, self.world_size)
 
-            # Send to device
-            inputs = seq[:-1].to(dtype=torch.int32, device="cuda", non_blocking=True)
-            targets = seq[1:].to(dtype=torch.int64, device="cuda", non_blocking=True)
+            # Effective input sequence length for this rank in this step
+            seq_len_for_inputs_this_rank_step = min(current_eval_seq_len, max_seq_len_per_rank_from_budget)
+            seq_len_for_inputs_this_rank_step = max(0, seq_len_for_inputs_this_rank_step)  # Cannot be negative
 
-            pos += self.world_size * seq_len
-            processed_tokens += self.world_size * seq_len
+            if seq_len_for_inputs_this_rank_step == 0:  # No more tokens to process for this rank or overall budget met
+                break
+
+            tokens_per_rank_for_seq = seq_len_for_inputs_this_rank_step + 1  # +1 for target
+            tokens_needed_for_batch_across_ranks = tokens_per_rank_for_seq * self.world_size
+
+            # Check if we need to load next shard from current file's perspective
+            if pos + tokens_needed_for_batch_across_ranks > len(tokens):
+                try:
+                    tokens, pos = self._load_data_shard(next(file_iter)), 0
+                except StopIteration:
+                    if self.rank == 0 and processed_tokens_count_total < self.val_tokens:
+                        print0(
+                            f"Warning (Val): Ran out of validation files. Processed {processed_tokens_count_total}/{self.val_tokens} tokens.",
+                            console=True)
+                    break  # No more files, end validation
+
+                # If new shard is still too small for one full distributed step at current seq_len
+                if pos + tokens_needed_for_batch_across_ranks > len(tokens):
+                    available_in_shard_for_all_ranks = len(tokens) - pos
+                    max_tokens_per_rank_this_shard = available_in_shard_for_all_ranks // max(1, self.world_size)
+
+                    # Adjust tokens_per_rank_for_seq if shard is too small
+                    tokens_per_rank_for_seq = min(tokens_per_rank_for_seq, max_tokens_per_rank_this_shard)
+                    seq_len_for_inputs_this_rank_step = max(0, tokens_per_rank_for_seq - 1)
+
+                    if seq_len_for_inputs_this_rank_step == 0:
+                        # print0(f"Rank {self.rank} (Val): Shard too small after load, skipping to next file/ending.", console=True)
+                        continue  # Try next shard or end if this was the last
+
+            # Extract validation sequence for this rank
+            rank_start_offset = pos + self.rank * tokens_per_rank_for_seq
+            rank_end_offset = rank_start_offset + tokens_per_rank_for_seq
+
+            # Defensive checks for slice validity
+            if seq_len_for_inputs_this_rank_step == 0 or rank_end_offset > len(tokens) or rank_start_offset > len(
+                    tokens) or rank_start_offset > rank_end_offset:
+                # print0(f"Rank {self.rank} (Val): Zero seq_len or invalid slice. Pos {pos}, Start {rank_start_offset}, End {rank_end_offset}, LenTokens {len(tokens)}, SeqLenInp {seq_len_for_inputs_this_rank_step}", console=True)
+                # To ensure DDP synchrony, all ranks should ideally skip or all proceed.
+                # If seq_len is 0, all ranks will have 0 and should break/continue together.
+                if seq_len_for_inputs_this_rank_step == 0:  # Make sure all ranks break or continue
+                    # if self.world_size > 1: dist.barrier() # Ensure all ranks hit this point
+                    break  # if this is due to budget, all ranks should break. If due to small shard, all ranks continue.
+                    # the `continue` for small shard is above. This break is likely budget.
+
+            seq_for_rank = tokens[rank_start_offset:rank_end_offset]
+
+            inputs = seq_for_rank[:-1].to(dtype=torch.int32, device="cuda", non_blocking=True)
+            targets = seq_for_rank[1:].to(dtype=torch.int64, device="cuda", non_blocking=True)
+
+            # Advance global file position
+            pos += tokens_per_rank_for_seq * self.world_size
+
+            # Update total processed tokens count
+            processed_tokens_this_step_all_ranks = seq_len_for_inputs_this_rank_step * self.world_size
+            processed_tokens_count_total += processed_tokens_this_step_all_ranks
+
             yield inputs, targets
+
+    def update_step(self, step: int):
+        self.current_step = step
 
 
 # -----------------------------------------------------------------------------
@@ -343,6 +460,7 @@ class CMATrainingHelper:
                     num_predicted_tokens = logits.size(1)
 
                 if num_predicted_tokens > 0:
+                    print0(f"VALIDATION LOSS INPUT: logits shape {logits.view(-1, logits.size(-1)).shape}, targets shape {actual_targets_for_loss.view(-1).shape}")
                     pred_loss = F.cross_entropy(
                         logits.view(-1, logits.size(-1)),
                         actual_targets_for_loss.view(-1),
@@ -359,54 +477,92 @@ class CMATrainingHelper:
 
 @dataclass
 class Hyperparameters:
-    DEBUG_LEVEL = 2  # 0=warnings/errors/etc. only, 1=debug, 2=info
+    DEBUG_LEVEL = 0 # 0=warnings/errors/etc. only, 1=debug, 2=info
 
     # data
     train_files = "data/fineweb10B/fineweb_train_*.bin"
     val_files = "data/fineweb10B/fineweb_val_*.bin"
-    val_tokens = 204800 #10485760
-    train_seq_len = 8*1024
+    val_tokens = 819200 #10485760
+
+    # Sequence length curriculum parameters
+    base_seq_len = 512  # Base sequence length
+    seq_init_mult = 8  # Initial sequence length multiplier
+    seq_final_mult = 20  # Final sequence length multiplier
+    seq_ramp_frac = 0.5  # Fraction of total steps to reach final multiplier
+    seq_short_prob = 0.5  # Probability of using shorter sequence
+    seq_var_factor = 0.1  # Max reduction factor for shorter sequences
+    # TODO: When current sequence mult < seq_final_mult, multiply batch size by min(1, seq_final_mult // current mul)
 
     # CMA specific
-    chunk_size_min = 1024 #128 #256  # Chunk size starts here and...
+    chunk_size_min = 1024 # Chunk size starts here and...
     chunk_size_max = 1024  # Will be progressively increased to this max
-    max_memory_size = 64 #3072
-    reverse_memory_size = 32 #320
-    memory_cap_length = 10240
-    reverse_max_chunks = 3
+    memory_cap_length = 6144
+    max_memory_size = 192
+    reverse_memory_size = 32
+    reverse_max_chunks = 2
+    initial_write_fraction = 0.5
+    share_initial_memory = False
+    reset_memory_on_cycle = True
+    gate_bias_init = 1.0
+    gate_regularization_type = "entropy"
+    gate_regularization_strength = 0.01
+    gate_saturation_penalty = True
+    enable_mask_future_dropout = True
+    mask_future_schedule = [0.25, 0.7]
+    mask_future_rates = [0.75, 0.9, 1.0]
 
-    # model architecture  
+    # model architecture
     vocab_size = 50257
-    embed_dim = 512 #768
-    n_heads = 4 #6
-    head_dim = 128 #128  # Typically embed_dim // n_heads
-    n_layers = 9 #12
+    embed_dim = 512 #384/4/96/4, 512/8/64/8, 768/6/128/12
+    n_heads = 8
+    head_dim = 64  # Typically embed_dim // n_heads
+    n_layers = 8
     layer_structure = [
-        {"type": "local_only"},
-        {"type": "local_only"},
-        {"type": "local_only"},
         {"type": "memory_update"},
         {"type": "local_only"},
         {"type": "local_only"},
         {"type": "local_only"},
+        #{"type": "local_only"},
+        #{"type": "local_only"},
+        #{"type": "memory_update"},
         {"type": "local_only"},
+        {"type": "local_only"},
+        {"type": "local_only"},
+        # {"type": "local_only"},
+        # {"type": "local_only"},
         {"type": "memory_update"},
     ]
-    skip_attention_layers = None #(3,)
+    skip_attention_layers = [3,5,] #None
+    enable_canon: bool = True
 
     # optimization
     num_iterations = 1770
     cooldown_frac = 0.4
-    gradient_accumulation_steps = 19  # Accumulate gradients over multiple sequences before update
+    gradient_accumulation_steps = 8  # Accumulate gradients over multiple sequences before update
+    # learning rates
+    lr_adam_lm_head = 0.0035
+    lr_adam_embed = 0.5
+    lr_adam_init_fwd = 0.0035
+    lr_adam_init_rev_la = 0.0035
+    lr_adam_init_rev_p = 0.0035
+    lr_adam_control_proj = 0.00001  # Currently all Muon
+    lr_adam_attn_gates = 0.000095  # Mixed Adam/Muon
+    lr_adam_update_gates = 0.005
+    lr_adam_other = 0.01  # Currently none / in Muon
+    lr_muon = 0.045
+    # betas and momentum
+    adam_beta1 = 0.8
+    adam_beta2 = 0.95
+    muon_momentum = 0.95
 
     # evaluation and logging
-    val_loss_every = 125
+    val_loss_every = 25  #125
     save_checkpoint = False
 
 
 args = Hyperparameters()
 
-assert args.train_seq_len > args.chunk_size_min
+assert args.base_seq_len * args.seq_init_mult >= args.chunk_size_min
 
 # Setup distributed training
 try:
@@ -459,16 +615,20 @@ config = CMAConfig(
     memory_cap_length=args.memory_cap_length,
     reverse_memory_size=args.reverse_memory_size,
     reverse_max_chunks=args.reverse_max_chunks,
+    initial_write_fraction=args.initial_write_fraction,
     embed_dim=args.embed_dim,
     n_heads=args.n_heads,
     head_dim=args.head_dim,
     n_layers=args.n_layers,
-    share_initial_memory=False,
-    reset_memory_on_cycle=True,
-    enable_mask_future_dropout=True,
-    gate_regularization_type="entropy",
-    gate_regularization_strength=0.005,
-    # Use simple layer structure for now
+    share_initial_memory=args.share_initial_memory,
+    reset_memory_on_cycle=args.reset_memory_on_cycle,
+    gate_bias_init=args.gate_bias_init,
+    gate_regularization_type=args.gate_regularization_type,
+    gate_regularization_strength=args.gate_regularization_strength,
+    gate_saturation_penalty=args.gate_saturation_penalty,
+    enable_mask_future_dropout=args.enable_mask_future_dropout,
+    mask_future_schedule=args.mask_future_schedule,
+    mask_future_rates=args.mask_future_rates,
     layer_structure=args.layer_structure,
     DEBUG_LEVEL=args.DEBUG_LEVEL,
     logfile=logfile
@@ -477,7 +637,7 @@ config = CMAConfig(
 # Create model
 model_without_ddp = CMAModel(config, args.vocab_size).cuda() # Create the base model
 total_params = sum(p.numel() for p in model_without_ddp.parameters())
-print0(f"Model created with {total_params} parameters", console=True)
+print0(f"Model created with {total_params:,} parameters", console=True)
 
 # DDP Setup
 ddp_active = False
@@ -506,7 +666,7 @@ else:
 underlying_model = model.module if ddp_active else model
 
 data_handler = CMADataHandler(
-    args.train_files, args.val_files, args.train_seq_len, args.val_tokens, rank, world_size
+    args.train_files, args.val_files, args.base_seq_len * args.seq_final_mult, args.val_tokens, rank, world_size
 )
 # Pass the underlying_model to CMATrainingHelper if it needs to access specific
 # attributes of CMAModel not exposed by DDP wrapper (like .config directly).
@@ -546,10 +706,10 @@ if hasattr(underlying_model, 'initial_fwd_params'):
     for i, p in enumerate(underlying_model.initial_fwd_params):
         if p.requires_grad and f"initial_fwd_params.{i}" not in adam_params_dict:
             adam_params_dict[f"initial_fwd_params.{i}"] = p
-if hasattr(underlying_model, 'initial_rev_s_params'):
-    for i, p in enumerate(underlying_model.initial_rev_s_params):
-        if p.requires_grad and f"initial_rev_s_params.{i}" not in adam_params_dict:
-            adam_params_dict[f"initial_rev_s_params.{i}"] = p
+if hasattr(underlying_model, 'initial_rev_la_params'):
+    for i, p in enumerate(underlying_model.initial_rev_la_params):
+        if p.requires_grad and f"initial_rev_la_params.{i}" not in adam_params_dict:
+            adam_params_dict[f"initial_rev_la_params.{i}"] = p
 if hasattr(underlying_model, 'initial_rev_p_params'):
     for i, p in enumerate(underlying_model.initial_rev_p_params):
         if p.requires_grad and f"initial_rev_p_params.{i}" not in adam_params_dict:
@@ -569,27 +729,36 @@ other_adam_params_by_group = {
 }
 
 
-
 for name, param in underlying_model.named_parameters():
     if not param.requires_grad or id(param) in adam_assigned_param_ids:
         continue  # Skip if no grad or already explicitly handled for Adam
 
     # CMA Specific Components
+    # Currently all Muon
     if "control_proj" in name:  # control_proj.weight (2D)
         if param.ndim != 2:
+            #print("control adam")
             other_adam_params_by_group["cma_control_proj"].append(param)
             adam_assigned_param_ids.add(id(param))
         else:
+            #print("control muon")
             muon_candidate_params.append(param)
+    elif "memory_gate_proj" in name:  # fwd/rev_memory_gate_proj (update gate W)
+        #if param.ndim < 2:
+          #  print("memory proj adam")
+            other_adam_params_by_group["cma_update_gates"].append(param)
+            adam_assigned_param_ids.add(id(param))
+        #else:
+         #   print("memory proj muon")
+        #    muon_candidate_params.append(param)
     elif "gate_proj" in name:  # CascadeMemoryAttention.gate_proj (attn gate W+B)
-        if param.ndim != 2:
+        if param.ndim < 2:
+            #print("gate proj adam")
             other_adam_params_by_group["cma_attn_gates"].append(param)
             adam_assigned_param_ids.add(id(param))
         else:
+            #print("gate proj muon")
             muon_candidate_params.append(param)
-    elif "memory_gate_proj" in name:  # fwd/rev_memory_gate_proj (update gate W)
-        other_adam_params_by_group["cma_update_gates"].append(param)
-        adam_assigned_param_ids.add(id(param))
     elif param.ndim != 2:  # All other 1D params (biases, single norms if any)
         other_adam_params_by_group["other_biases_and_scalars"].append(param)
         adam_assigned_param_ids.add(id(param))
@@ -600,34 +769,33 @@ for name, param in underlying_model.named_parameters():
 
 # Construct Adam param groups
 adam_param_groups_list = [
-    dict(params=list(underlying_model.lm_head.parameters()), lr=0.0035, name="lm_head"),
-    dict(params=list(underlying_model.token_embedding.parameters()), lr=0.5, name="token_embedding")
+    dict(params=list(underlying_model.lm_head.parameters()), lr=args.lr_adam_lm_head, name="lm_head"),
+    dict(params=list(underlying_model.token_embedding.parameters()), lr=args.lr_adam_embed, name="token_embedding")
 ]
 if hasattr(underlying_model, 'initial_fwd_params') and underlying_model.initial_fwd_params:
     adam_param_groups_list.append(
-        dict(params=list(underlying_model.initial_fwd_params), lr=0.0035, name="initial_fwd_mem"))
-if hasattr(underlying_model, 'initial_rev_s_params') and underlying_model.initial_rev_s_params:
+        dict(params=list(underlying_model.initial_fwd_params), lr=args.lr_adam_init_fwd, name="initial_fwd_mem"))
+if hasattr(underlying_model, 'initial_rev_la_params') and underlying_model.initial_rev_la_params:
     adam_param_groups_list.append(
-        dict(params=list(underlying_model.initial_rev_s_params), lr=0.0035, name="initial_rev_s_mem"))
+        dict(params=list(underlying_model.initial_rev_la_params), lr=args.lr_adam_init_rev_la, name="initial_rev_la_mem"))
 if hasattr(underlying_model, 'initial_rev_p_params') and underlying_model.initial_rev_p_params:
     adam_param_groups_list.append(
-        dict(params=list(underlying_model.initial_rev_p_params), lr=0.0035, name="initial_rev_p_mem"))
+        dict(params=list(underlying_model.initial_rev_p_params), lr=args.lr_adam_init_rev_p, name="initial_rev_p_mem"))
 
-# Currently in Muon
+# Currently all Muon
 if other_adam_params_by_group["cma_control_proj"]:
     adam_param_groups_list.append(
-        dict(params=other_adam_params_by_group["cma_control_proj"], lr=0.012, name="cma_control_proj"))
+        dict(params=other_adam_params_by_group["cma_control_proj"], lr=args.lr_adam_control_proj, name="cma_control_proj"))
 if other_adam_params_by_group["cma_attn_gates"]:
     adam_param_groups_list.append(
-        dict(params=other_adam_params_by_group["cma_attn_gates"], lr=0.003, name="cma_attn_gates"))
-# Currently in Muon
+        dict(params=other_adam_params_by_group["cma_attn_gates"], lr=args.lr_adam_attn_gates, name="cma_attn_gates"))
 if other_adam_params_by_group["cma_update_gates"]:
     adam_param_groups_list.append(
-        dict(params=other_adam_params_by_group["cma_update_gates"], lr=0.0001, name="cma_update_gates"))
+        dict(params=other_adam_params_by_group["cma_update_gates"], lr=args.lr_adam_update_gates, name="cma_update_gates"))
 # Currently none / in Muon
 if other_adam_params_by_group["other_biases_and_scalars"]:
     adam_param_groups_list.append(
-        dict(params=other_adam_params_by_group["other_biases_and_scalars"], lr=0.01, name="other_biases_scalars"))
+        dict(params=other_adam_params_by_group["other_biases_and_scalars"], lr=args.lr_adam_other, name="other_biases_scalars"))
 
 adam_param_groups_filtered = [pg for pg in adam_param_groups_list if pg['params']]
 
@@ -691,8 +859,8 @@ else:
     #print0("Parameter coverage check: OKAY", console=True)
     pass
 
-optimizer1 = torch.optim.Adam(adam_param_groups_filtered, betas=(0.8, 0.95), eps=1e-10, fused=True)
-optimizer2 = Muon(final_muon_params, lr=0.045, momentum=0.95, rank=rank, world_size=world_size)
+optimizer1 = torch.optim.Adam(adam_param_groups_filtered, betas=(args.adam_beta1, args.adam_beta2), eps=1e-10, fused=True)
+optimizer2 = Muon(final_muon_params, lr=args.lr_muon, momentum=args.muon_momentum, rank=rank, world_size=world_size)
 optimizers = [optimizer1, optimizer2]
 
 for opt in optimizers:
@@ -719,7 +887,6 @@ def get_lr(step: int):
 # Curriculum learning: progressively increase chunk size
 def get_chunk_size(step: int):
     x = step / (args.num_iterations * 0.8)
-    # Linearly increase from 256 to 768 tokens
     min_chunk_size = args.chunk_size_min
     max_chunk_size = args.chunk_size_max
     current_size = int(min_chunk_size + x * (max_chunk_size - min_chunk_size))
@@ -729,13 +896,14 @@ def get_chunk_size(step: int):
 # Compile model (if using PyTorch 2.0+)
 print0("Compiling model...", console=True)
 try:
-    config.coordinate_descent_tuning = True
+    inductor_config.coordinate_descent_tuning = True
     model = torch.compile(model, dynamic=False)
     print0("Compile complete.", console=True)
 except:
     print0("Warning: torch.compile not available, running uncompiled model", console=True)
 
 train_loader = data_handler.get_training_data_generator()
+"""
 print0(f"Warming up model for 5 steps", console=True)
 model.train()
 for step in range(5):
@@ -760,6 +928,7 @@ for step in range(5):
     print0(f"########## WARMUP STEP {step} of 5 COMPLETE ##########")
 print0("\nWarmup complete.", console=True)
 train_loader = data_handler.get_training_data_generator()
+"""
 
 # Training loop
 training_time_ms = 0
@@ -786,36 +955,69 @@ for step in range(train_steps + 1):
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
 
-        val_steps = math.ceil(float(args.val_tokens) / args.train_seq_len)
-        print0(f"Running validation ({val_steps} steps)", console=True)
+        # Calculate current sequence length for validation based on training curriculum
+        # Ensure seq_final_mult - seq_init_mult is not zero for division
+        seq_mult_diff = args.seq_final_mult - args.seq_init_mult
+        ramp_denominator_inv_steps = ((args.seq_ramp_frac * args.num_iterations) / max(1, seq_mult_diff)) * args.gradient_accumulation_steps
+
+        current_mult_val = args.seq_init_mult
+        if ramp_denominator_inv_steps > 0:  # Avoid division by zero if ramp_steps or grad_accum_steps is 0
+            progression = step / ramp_denominator_inv_steps
+            current_mult_val = min(
+                args.seq_final_mult,
+                args.seq_init_mult + seq_mult_diff * progression
+            )
+        current_mult_val = int(math.floor(current_mult_val))
+        current_mult_val = max(1, current_mult_val)  # Ensure multiplier is at least 1
+
+        current_eval_seq_len = args.base_seq_len * current_mult_val
+        # Ensure it's at least a minimum practical length, e.g., smallest chunk size or base_seq_len
+        current_eval_seq_len = max(current_eval_seq_len, args.base_seq_len, args.chunk_size_min)
+
+        print0(f"Running validation with sequence length: {current_eval_seq_len} (val_tokens budget: {args.val_tokens})",
+               console=True)
         model.eval()
-        val_loader = data_handler.get_validation_data_generator()
+        # Pass the calculated sequence length to the validation data generator
+        val_loader = data_handler.get_validation_data_generator(current_eval_seq_len)
         val_loss = 0
-        val_count = 0
+        val_count = 0  # Counts number of validation batches processed
 
         with torch.no_grad():
-            for inputs, targets in val_loader:
-                model.reset_state()
+            for val_batch_idx, (inputs, targets) in enumerate(val_loader):  # val_batch_idx for debug print
+                if inputs.numel() == 0 or targets.numel() == 0:  # Skip if a rank got an empty batch
+                    # print0(f"Rank {rank} got empty val batch {val_batch_idx}, skipping", console=True) # Debug
+                    continue
+                model.reset_state()  # Reset state for each validation sequence
                 inputs_list = inputs.cpu().tolist()
                 targets_list = targets.cpu().tolist()
+                if model.config.DEBUG_LEVEL > 0:
+                    print0(f"DEBUG VAL PRE-FORWARD: ValIter {val_batch_idx}, "
+                                f"TotalTokensProcessed: {model.total_tokens_processed}, "
+                                f"NumClosedChunks: {len(model.closed_chunks)}, "
+                                f"M_fwd keys: {list(model.M_fwd.keys()) if model.M_fwd else 'None'}")
                 loss = training_helper.val_step(inputs_list, targets_list, step, train_steps)
                 val_loss += loss
                 val_count += 1
-                print(".", end='', flush=True)
-                print0(f"########## VALIDATION STEP {val_count} of {val_steps} COMPLETE ##########")
+                #print(".", end='', flush=True)  # Progress per batch
+                # Removed "of {val_steps}" as total steps is now dynamic
+                # print0(f"########## VALIDATION BATCH {val_count} COMPLETE (SeqLen: {inputs.size(1) if inputs.ndim > 1 else 0}) ##########")
 
         if val_count > 0:
             val_loss /= val_count
         else:
-            val_loss = 0.0
+            val_loss = 0.0  # Or some other indicator if no validation batches were run
 
         # Properly handle distributed validation loss
         val_loss_tensor = torch.tensor(val_loss, device=device)
-        dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.AVG)
+        # Synchronize before all_reduce if operations were async or on different streams, though val_step is sync.
+        if world_size > 1:  # only reduce if multiple processes
+            dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.AVG)
         val_loss = val_loss_tensor.item()
 
-        print0("\nValidation complete.", console=True)
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} chunk_size:{current_chunk_size} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms", console=True)
+        #print0("\nValidation complete.", console=True)
+        print0(
+            f"step:{step}/{train_steps} val_loss:{val_loss:.4f} chunk_size:{current_chunk_size} val_seq_len_curriculum:{current_eval_seq_len} val_batches_run:{val_count} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms",
+            console=True)
 
         model.train()
 
@@ -853,7 +1055,13 @@ for step in range(train_steps + 1):
         model.reset_state()
 
         # Get next sequence (inputs and targets are full sequence tensors)
+        data_handler.update_step(step)
         raw_inputs_tensor, raw_targets_tensor = next(train_loader)
+        if args.DEBUG_LEVEL > 0:
+            print0(f"DEBUG TRAIN PRE-FORWARD: Step {step}, MicroBatch {accum_step}, "
+                        f"TotalTokensProcessed: {model.total_tokens_processed}, "
+                        f"NumClosedChunks: {len(model.closed_chunks)}, "
+                        f"M_fwd keys: {list(model.M_fwd.keys()) if model.M_fwd else 'None'}")
 
         # Convert to lists for CMATrainingHelper and CMAModel
         # inputs_for_model is seq[:-1], targets_for_loss_calc is seq[1:]
@@ -905,12 +1113,12 @@ for step in range(train_steps + 1):
                 else:
                     print0(f"  initial_fwd_params[{i}]: No Grad")
         if hasattr(model_to_inspect,
-                   'initial_rev_s_params') and model_to_inspect.initial_rev_s_params:  # For completeness
-            for i, param in enumerate(model_to_inspect.initial_rev_s_params):
+                   'initial_rev_la_params') and model_to_inspect.initial_rev_la_params:  # For completeness
+            for i, param in enumerate(model_to_inspect.initial_rev_la_params):
                 if param.grad is not None:
-                    print0(f"  initial_rev_s_params[{i}]: {param.grad.norm().item():.4e}")
+                    print0(f"  initial_rev_la_params[{i}]: {param.grad.norm().item():.4e}")
                 else:
-                    print0(f"  initial_rev_s_params[{i}]: No Grad")
+                    print0(f"  initial_rev_la_params[{i}]: No Grad")
         if hasattr(model_to_inspect, 'initial_rev_p_params') and model_to_inspect.initial_rev_p_params:
             for i, param in enumerate(model_to_inspect.initial_rev_p_params):
                 if param.grad is not None:

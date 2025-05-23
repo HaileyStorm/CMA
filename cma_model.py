@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Tuple, Optional, List, Dict
 import tiktoken
 import torch.nn as nn
 from cma_components import *
@@ -16,6 +16,42 @@ class LayerGroup:
     read_only_layer_indices: List[int] = field(default_factory=list)
     local_only_layer_indices: List[int] = field(default_factory=list)
     has_memory: bool = False  # True if memory_update_layer_idx is not None
+
+
+class CanonConv(nn.Module):
+    """Causal 1D depth-wise convolution for Canon."""
+
+    def __init__(self, dim: int, kernel_size: int = 4):
+        super().__init__()
+        self.conv = nn.Conv1d(
+            in_channels=dim,
+            out_channels=dim,
+            kernel_size=kernel_size,
+            groups=dim,
+            padding=kernel_size - 1  # This padding + slicing makes it causal
+        )
+        # Default Kaiming uniform initialization for Conv1d is fine, as requested.
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, D)
+        if x.ndim != 3 or x.size(1) == 0:  # (Batch, Seq, Dim)
+            # Handle cases with no sequence length or not 3D
+            return x
+
+        # Transpose for Conv1d: (B, D, T)
+        x_transposed = x.transpose(1, 2)
+
+        # Apply convolution
+        # Output of conv will have length T_in + (kernel_size-1) due to padding
+        # T_out = T_in + 2*padding - (kernel_size-1) = T_in + 2*(kernel_size-1) - (kernel_size-1) = T_in + kernel_size-1
+        y = self.conv(x_transposed)
+
+        # Slice to make output length same as input T and ensure causality
+        # Remove (kernel_size-1) elements from the end
+        y_sliced = y[:, :, :-(self.conv.padding[0])] if self.conv.padding[0] > 0 else y
+
+        # Transpose back and add residual: (B, T, D)
+        return x + y_sliced.transpose(1, 2)
 
 
 # -----------------------------------------------------------------------------
@@ -36,6 +72,13 @@ class CausalSelfAttention(nn.Module):
         # QKV projections
         self.qkv = nn.Linear(config.embed_dim, 3 * config.embed_dim, bias=False)
         self.out_proj = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
+
+        # Canon-B (for local_only layers)
+        self.canon_b: Optional[CanonConv] = None
+        if config.enable_canon:
+            # CausalSelfAttention is used for "local_only" layers, which get Canon-A, B, C, D.
+            # So, Canon-B is active here.
+            self.canon_b = CanonConv(config.embed_dim, config.canon_kernel_size)
 
         # Initialize output projection to zero if configured
         if config.output_proj_zero_init:
@@ -67,6 +110,11 @@ class CausalSelfAttention(nn.Module):
 
         # Reshape and project output
         attn_output = attn_output.transpose(1, 2).contiguous().view(B, T, C)
+
+        # Apply Canon-B if active
+        if self.canon_b is not None:
+            attn_output = self.canon_b(attn_output)
+
         output = self.out_proj(attn_output)
 
         return output
@@ -90,6 +138,13 @@ class CascadeMemoryAttention(nn.Module):
         self.k_proj = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
         self.v_proj = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
         self.out_proj = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
+
+        # Canon-B
+        self.canon_b: Optional[CanonConv] = None
+        if config.enable_canon:
+            if not self.is_memory_update:  # memory_read layers get Canon-B
+                self.canon_b = CanonConv(config.embed_dim, config.canon_kernel_size)
+            # memory_update layers do NOT get Canon-B
 
         # Control token integration
         if config.integration_method == "query_fusion":
@@ -180,6 +235,11 @@ class CascadeMemoryAttention(nn.Module):
             gate_reg_loss = None
 
         attn_output = attn_output.transpose(1, 2).contiguous().view(B, T, C)
+
+        # Apply Canon-B if active
+        if self.canon_b is not None:
+            attn_output = self.canon_b(attn_output)
+
         output = self.out_proj(attn_output)
 
         # -------- optional memory update ----------------------------------------
@@ -266,11 +326,36 @@ class CascadeMemoryAttention(nn.Module):
 
         # gate g for every query token
         gate_logits = self.gate_proj(q.permute(0, 2, 1, 3).reshape(B, T, -1))  # (B,T,h)
-        g = torch.sigmoid(gate_logits).permute(0, 2, 1).unsqueeze(-1)  # (B,h,T,1)
+        g = torch.sigmoid(gate_logits).permute(0, 2, 1).unsqueeze(-1)  #
+        if mem_len > 0 and self.config.DEBUG_LEVEL > 0 and (
+                torch.rand(1).item() < 0.05 or not self.training):  # Sample, or always for val
+            # v_chunk and v_mem are (B, h, T_chunk/T_mem, d_head)
+            # q is (B, h, T_query, d_head)
+            # To get overall std, might need to reshape or take norm per head then average.
+            # For simplicity, let's take mean std across heads.
+            v_chunk_std = v_chunk.std(dim=(-1, -2)).mean().item() if v_chunk.numel() > 0 else 0.0
+            v_mem_std = v_mem.std(dim=(-1, -2)).mean().item() if v_mem.numel() > 0 else 0.0
+            g_mean = g.mean().item()
 
-        if self.config.DEBUG_LEVEL > 0:
+            print0(
+                f"DEBUG CMA Layer {self.layer_idx} _apply_gate details (training={self.training}): "  # Pass training status
+                f"Step {self.config.training_step if hasattr(self.config, 'training_step') else 'N/A'}, "  # Access training_step if available
+                f"g_mean={g_mean:.4f}, v_chunk_std={v_chunk_std:.4f}, v_mem_std={v_mem_std:.4f}",
+                self.config.logfile)
+
+        if self.config.DEBUG_LEVEL > 0 and abs(g.mean() - 0.99) > 0.05:
             print0(
                 f"DEBUG CMA Layer {self.layer_idx} _apply_gate: gate_logits min/max/mean, g min/max/mean: {gate_logits.min().item()}, {gate_logits.max().item()}, {gate_logits.mean().item()}, {g.min().item()}, {g.max().item()}, {g.mean().item()}", self.config.logfile)
+        if self.config.DEBUG_LEVEL > 0 and torch.rand(1).item() < 0.05:  # Sample 5% of calls
+            local_contrib_norm = Y_chunk.norm().item()
+            g_Y_mem_norm = (g * Y_mem).norm().item()  # Norm of the gated memory contribution
+            g_mean = g.mean().item()
+            print0(f"DEBUG CMA Layer {self.layer_idx} _apply_gate contributions: "
+                   f"Y_chunk_norm={local_contrib_norm:.4f}, (g*Y_mem)_norm={g_Y_mem_norm:.4f}, "
+                   f"ratio_mem_to_local={(g_Y_mem_norm / (local_contrib_norm + 1e-9)):.2f}, "
+                   f"g_mean={g_mean:.4f}, training_mode_in_model={self.training}",
+                   # Assuming self.training reflects current model.training state
+                   self.config.logfile)
 
         Y = Y_chunk + g * Y_mem  # final fused output
 
@@ -281,6 +366,13 @@ class CascadeMemoryAttention(nn.Module):
         elif self.config.gate_regularization_type == "entropy":
             ent = -(g * torch.log(g + 1e-8) + (1 - g) * torch.log(1 - g + 1e-8))
             reg_loss = self.config.gate_regularization_strength * torch.mean(ent)
+        if self.training and self.config.gate_regularization_type is not None and self.config.gate_saturation_penalty:
+            # Add saturation penalty to encourage more balanced gating
+            gate_saturation_penalty = torch.mean(torch.square(g - 0.5)) * 0.01
+            if reg_loss is None:
+                reg_loss = gate_saturation_penalty
+            else:
+                reg_loss = reg_loss + gate_saturation_penalty
 
         #if self.config.DEBUG_LEVEL > 1 and reg_loss is not None: print0(f"DEBUG CMA Layer {self.layer_idx} _apply_gate: reg_loss: {reg_loss.item()}", self.config.logfile)
 
@@ -356,10 +448,8 @@ class Block(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        # Layer type determines behavior w.r.t memory group
-        self.layer_type = layer_type  # "local_only", "memory_read", "memory_update", "skip"
+        self.layer_type = layer_type
 
-        # Create attention layer based on type
         if self.layer_type == "skip":
             self.attn = None
         elif layer_type in ["memory_read", "memory_update"]:
@@ -368,80 +458,60 @@ class Block(nn.Module):
         else:  # local_only
             self.attn = CausalSelfAttention(config, layer_idx)
 
-        # MLP
-        self.mlp = nn.Sequential(
-            nn.Linear(config.embed_dim, 4 * config.embed_dim, bias=False),
-            nn.GELU(),
-            nn.Linear(4 * config.embed_dim, config.embed_dim, bias=False)
-        )
+        self.mlp_fc1 = nn.Linear(config.embed_dim, 4 * config.embed_dim, bias=False)
+        self.mlp_act = nn.GELU()
+        self.mlp_fc2 = nn.Linear(4 * config.embed_dim, config.embed_dim, bias=False)
+
+        self.canon_a: Optional[CanonConv] = None
+        self.canon_c: Optional[CanonConv] = None
+        self.canon_d: Optional[CanonConv] = None
+
+        if config.enable_canon and self.layer_type != "skip":
+            canon_dim = config.embed_dim
+            canon_kernel = config.canon_kernel_size
+            self.canon_a = CanonConv(canon_dim, canon_kernel)
+            self.canon_c = CanonConv(canon_dim, canon_kernel)
+            if self.layer_type == "local_only":
+                self.canon_d = CanonConv(4 * config.embed_dim, canon_kernel)
 
     def forward(
             self,
             x: Tensor,
-            # Pass the *dictionaries* of memory states
             M_fwd_dict: Dict[int, Tensor],
             M_rev_ahead_dict: Dict[int, Tensor],
             M_rev_persist_dict: Dict[int, Tensor],
-            # Pass the group ID for this layer
             group_id: int,
-            # Pass the current operational mode/pass name
-            mode: str,  # "forward", "lookahead_reverse", "persistent_reverse", "generate"
+            mode: str,
             control_tokens: Optional[Dict[str, float]] = None,
-            write_mask: Optional[Tensor] = None,  # Forward pass only
-            decay_weights: Optional[Tensor] = None  # Reverse passes only
+            write_mask: Optional[Tensor] = None,
+            decay_weights: Optional[Tensor] = None,
+            total_logical_sequence_length: int = 0 # MODIFIED: Parameter name
     ) -> Tuple[Tensor, Optional[Tuple[int, Tensor]], Optional[Tuple[int, Tensor]], Optional[Tensor]]:
-        """
-        Forward pass for a block, aware of its group and the current pass mode.
-
-        Args:
-            x: Input tensor (B, T, D).
-            M_fwd_dict: Dictionary mapping group_id to forward memory tensor.
-            M_rev_ahead_dict: Dictionary mapping group_id to lookahead reverse memory tensor.
-            M_rev_persist_dict: Dictionary mapping group_id to persistent reverse memory tensor.
-            group_id: The index of the group this layer belongs to.
-            mode: The current processing mode/pass.
-            control_tokens: Control signals.
-            write_mask: Mask for forward memory updates.
-            decay_weights: Weights for reverse memory updates.
-
-        Returns:
-            Tuple:
-                - output_tensor (Tensor): Result after block processing.
-                - updated_fwd (Optional[Tuple[int, Tensor]]): (group_id, updated_tensor) if fwd mem updated.
-                - updated_rev (Optional[Tuple[int, Tensor]]): (group_id, updated_tensor) if rev mem updated.
-                - gate_reg_loss (Optional[Tensor]): Regularization loss from gating.
-        """
         updated_fwd_result = None
         updated_rev_result = None
         gate_reg_loss = None
-        attn_output = torch.zeros_like(x)  # Default if attention is skipped
 
-        # --- Determine Memory Inputs and Update Flags based on Group and Mode ---
         fwd_mem_in: Optional[Tensor] = None
         rev_mem_in: Optional[Tensor] = None
         do_memory_update: bool = False
         is_reverse_update: bool = False
 
-        # Only access memory if the layer is not local_only and not skip
+        can_update = (self.layer_type == "memory_update")
+        seq_len_cond_met = (total_logical_sequence_length > self.config.chunk_size)
+        do_memory_update = can_update and seq_len_cond_met
         if self.layer_type not in ["local_only", "skip"]:
-            # Fetch memory relevant to the current mode
-            if mode == "forward":
+            chunk_size = self.config.chunk_size
+            if mode == "forward": # Pass 2 of cycle, or _process_current_chunk
                 fwd_mem_in = M_fwd_dict.get(group_id)
-                rev_mem_in = M_rev_ahead_dict.get(group_id)  # Forward pass uses Lookahead Reverse
-                # Update forward memory only if this is the group's update layer
-                do_memory_update = (self.layer_type == "memory_update")
-                is_reverse_update = False
-            elif mode == "lookahead_reverse":
-                # No forward memory input in reverse passes
-                rev_mem_in = M_rev_ahead_dict.get(group_id)
-                do_memory_update = (self.layer_type == "memory_update")
-                is_reverse_update = True
-            elif mode == "persistent_reverse":
                 rev_mem_in = M_rev_persist_dict.get(group_id)
-                do_memory_update = (self.layer_type == "memory_update")
+                is_reverse_update = False
+            elif mode == "lookahead_reverse": # Pass 1
+                rev_mem_in = M_rev_ahead_dict.get(group_id)
+                is_reverse_update = True
+            elif mode == "persistent_reverse": # Pass 3
+                rev_mem_in = M_rev_persist_dict.get(group_id)
                 is_reverse_update = True
             elif mode == "generate":
-                # Generation reads Fwd and Persistent Reverse, never updates
                 fwd_mem_in = M_fwd_dict.get(group_id)
                 rev_mem_in = M_rev_persist_dict.get(group_id)
                 do_memory_update = False
@@ -449,38 +519,55 @@ class Block(nn.Module):
             else:
                 raise ValueError(f"Unknown mode in Block.forward: {mode}")
 
-        # --- Attention + Residual ---
+        if can_update and self.config.DEBUG_LEVEL > 0:  # Log for all memory update layers
+            print0(
+                f"DEBUG Block L{self.layer_idx} (mode={mode}, training={self.training}): "
+                f"do_memory_update eval: total_log_seq_len={total_logical_sequence_length}, "
+                f"chunk_size={self.config.chunk_size}, seq_len_cond_met={seq_len_cond_met}, "
+                f"final_do_update_decision={do_memory_update}",
+                self.config.logfile
+            )
+
+        if self.canon_a is not None:
+            x = self.canon_a(x)
+        x_after_canon_a = x
+
         if self.attn is not None:
-            residual = x
-            x_norm = norm(x)
+            residual = x_after_canon_a
+            x_norm = norm(x_after_canon_a)
 
             if isinstance(self.attn, CascadeMemoryAttention):
-                # Pass the determined memory inputs and flags
-                attn_output, fwd_mem_out, rev_mem_out, gate_reg_loss = self.attn(
+                attn_output_val, fwd_mem_out, rev_mem_out, gate_reg_loss = self.attn(
                     x_norm,
                     forward_memory=fwd_mem_in,
-                    reverse_memory=rev_mem_in,
+                    reverse_memory=rev_mem_in, # Will use M_rev_persist if mode="forward"
                     control_tokens=control_tokens,
-                    do_memory_update=do_memory_update,
-                    write_mask=write_mask if not is_reverse_update else None,  # Only pass write_mask for fwd update
-                    decay_weights=decay_weights if is_reverse_update else None,  # Only pass decay for rev update
+                    do_memory_update=do_memory_update, # Flag uses corrected total_logical_sequence_length
+                    write_mask=write_mask if not is_reverse_update else None,
+                    decay_weights=decay_weights if is_reverse_update else None,
                     is_reverse_update=is_reverse_update
                 )
-                # Package updated memory with group_id for return
                 if fwd_mem_out is not None: updated_fwd_result = (group_id, fwd_mem_out)
                 if rev_mem_out is not None: updated_rev_result = (group_id, rev_mem_out)
-
             elif isinstance(self.attn, CausalSelfAttention):
-                # Local attention only operates on x_norm
-                attn_output = self.attn(x_norm)
+                attn_output_val = self.attn(x_norm)
+            else:
+                attn_output_val = torch.zeros_like(x_after_canon_a)
+            x = residual + attn_output_val
+        else:
+            x = x_after_canon_a
 
-            x = residual + attn_output
-        # If self.attn is None (skip layer), x remains unchanged
+        if self.canon_c is not None:
+            x = self.canon_c(x)
+        x_after_canon_c = x
 
-        # --- MLP + Residual ---
-        residual = x
-        x_norm = norm(x)
-        mlp_output = self.mlp(x_norm)
+        residual = x_after_canon_c
+        x_norm = norm(x_after_canon_c)
+        mlp_hidden = self.mlp_fc1(x_norm)
+        mlp_hidden = self.mlp_act(mlp_hidden)
+        if self.canon_d is not None:
+            mlp_hidden = self.canon_d(mlp_hidden)
+        mlp_output = self.mlp_fc2(mlp_hidden)
         x = residual + mlp_output
 
         return x, updated_fwd_result, updated_rev_result, gate_reg_loss
@@ -606,42 +693,42 @@ class CMAModel(nn.Module):
                 print0("Using shared initial memory parameters.", self.config.logfile)
                 shared_fwd = nn.Parameter(
                     torch.randn(1, config.max_memory_size, config.embed_dim) * config.memory_init_scale)
-                shared_rev_s = nn.Parameter(
+                shared_rev_la = nn.Parameter(
                     torch.randn(1, config.reverse_memory_size, config.embed_dim) * config.memory_init_scale)
                 shared_rev_p = nn.Parameter(
                     torch.randn(1, config.reverse_memory_size, config.embed_dim) * config.memory_init_scale)
                 self.initial_fwd_params = nn.ParameterList([shared_fwd] * self.num_memory_groups)
-                self.initial_rev_s_params = nn.ParameterList([shared_rev_s] * self.num_memory_groups)
+                self.initial_rev_la_params = nn.ParameterList([shared_rev_la] * self.num_memory_groups)
                 self.initial_rev_p_params = nn.ParameterList([shared_rev_p] * self.num_memory_groups)
                 for group in self.layer_groups:
                     if group.has_memory: self.group_id_to_memory_idx[group.group_idx] = 0
                 memory_param_idx_counter = 1
             else:
                 print0("Using dedicated initial memory parameters per group.", self.config.logfile)
-                fwd_params, rev_s_params, rev_p_params = [], [], []
+                fwd_params, rev_la_params, rev_p_params = [], [], []
                 for group in self.layer_groups:
                     if group.has_memory:
                         self.group_id_to_memory_idx[group.group_idx] = memory_param_idx_counter
                         fwd_params.append(nn.Parameter(
                             torch.randn(1, config.max_memory_size, config.embed_dim) * config.memory_init_scale))
-                        rev_s_params.append(nn.Parameter(
+                        rev_la_params.append(nn.Parameter(
                             torch.randn(1, config.reverse_memory_size, config.embed_dim) * config.memory_init_scale))
                         rev_p_params.append(nn.Parameter(
                             torch.randn(1, config.reverse_memory_size, config.embed_dim) * config.memory_init_scale))
                         memory_param_idx_counter += 1
                 self.initial_fwd_params = nn.ParameterList(fwd_params)
-                self.initial_rev_s_params = nn.ParameterList(rev_s_params)
+                self.initial_rev_la_params = nn.ParameterList(rev_la_params)
                 self.initial_rev_p_params = nn.ParameterList(rev_p_params)
 
             # Ensure all parameters are on the correct device
             device = self.token_embedding.weight.device
-            for param_list in [self.initial_fwd_params, self.initial_rev_s_params, self.initial_rev_p_params]:
+            for param_list in [self.initial_fwd_params, self.initial_rev_la_params, self.initial_rev_p_params]:
                 for param in param_list:
                     param.data = param.data.to(device)
         else:
             print0("No memory groups found. Initial memory parameters will not be created.", self.config.logfile)
             self.initial_fwd_params = nn.ParameterList()
-            self.initial_rev_s_params = nn.ParameterList()
+            self.initial_rev_la_params = nn.ParameterList()
             self.initial_rev_p_params = nn.ParameterList()
         print0(f"Created {memory_param_idx_counter} sets of initial memory parameters.", self.config.logfile)
         # --- End Initialize Memory Parameters ---
@@ -659,9 +746,18 @@ class CMAModel(nn.Module):
         self.current_chunk_text: str = ""
         self.training_step = 0
         self.total_training_steps = 10000
+        self.total_seq_len = 0
 
         # Initialize weights
         self.apply(self._init_weights)
+
+        # Explicitly re-apply gate_bias_init after generic initialization
+        for layer_block in self.layers:
+            if isinstance(layer_block.attn, CascadeMemoryAttention):
+                if hasattr(layer_block.attn.gate_proj, 'bias') and layer_block.attn.gate_proj.bias is not None:
+                    nn.init.constant_(layer_block.attn.gate_proj.bias, self.config.gate_bias_init)
+                    if self.config.DEBUG_LEVEL > 0 and self.config.logfile:  # Ensure logfile exists
+                        print0(f"DEBUG: Explicitly set gate_proj.bias for layer {layer_block.layer_idx} to {self.config.gate_bias_init}", self.config.logfile)
 
         # --- Parameter Count ---
         total_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -670,8 +766,8 @@ class CMAModel(nn.Module):
         initial_memory_params = 0
         if hasattr(self, 'initial_fwd_params'): initial_memory_params += sum(
             p.numel() for p in self.initial_fwd_params if p.requires_grad)
-        if hasattr(self, 'initial_rev_s_params'): initial_memory_params += sum(
-            p.numel() for p in self.initial_rev_s_params if p.requires_grad)
+        if hasattr(self, 'initial_rev_la_params'): initial_memory_params += sum(
+            p.numel() for p in self.initial_rev_la_params if p.requires_grad)
         if hasattr(self, 'initial_rev_p_params'): initial_memory_params += sum(
             p.numel() for p in self.initial_rev_p_params if p.requires_grad)
         if config.share_initial_memory and self.num_memory_groups > 1:
@@ -792,60 +888,63 @@ class CMAModel(nn.Module):
             self,
             input_ids: Union[str, List[int], List[List[int]], torch.Tensor, None],
             *, training_mode: bool = False
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:  # Logits, Aggregated Gate Loss
-        """
-        CMA forward pass. Handles input processing, chunking, triggering update cycles.
-        During training and when an update cycle occurs, returns concatenated logits
-        from all chunks of the Forward Pass (Pass 2) and their aggregated gate loss.
-        Otherwise (or in eval mode), returns logits for the current/last processed chunk.
-        """
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: CMAModel.forward called with input_ids type={type(input_ids)}, training_mode={training_mode}", self.config.logfile)
 
-        self.training = training_mode  # Set nn.Module training state for all submodules
+        self.training = training_mode
+        if training_mode:
+            super().train(True)
+        else:
+            super().eval()
         self._initialize_memory_states(force_reset=False)
         dev = self.token_embedding.weight.device
 
-        # These will store results from the primary processing path
         final_logits: Optional[torch.Tensor] = None
         final_gate_loss: Optional[torch.Tensor] = None
+        num_new_tokens_for_this_call = 0 # Initialize
 
         if (input_ids is None or input_ids == "" or input_ids == [] or
                 (isinstance(input_ids, torch.Tensor) and input_ids.numel() == 0)):
+            # ---- SET current_total_logical_sequence_length for potentially empty input but existing buffer ----
+            self.current_total_logical_sequence_length = sum(len(c) for c in self.closed_chunks) + len(self.current_chunk_tokens)
+            if self.config.DEBUG_LEVEL > 0:
+                 print0(f"DEBUG CMAModel.forward: Empty/None input. Logical seq_len for current buffer set to {self.current_total_logical_sequence_length}", self.config.logfile)
+
             if self.current_chunk_tokens:
-                # _process_current_chunk no longer calls _initialize_memory_states
                 final_logits, final_gate_loss = self._process_current_chunk(generation_mode=not self.training)
             else:
                 final_logits = torch.zeros(1, 0, self.vocab_size, device=dev)
         else:
-            # --- Input processing and cycle trigger logic ---
             new_tokens: List[int]
-            input_processing_mode: str  # 'semantic', 'fixed', 'caller_exact'
+            input_processing_mode: str
             if isinstance(input_ids, str):
                 new_tokens = self.tokenizer.encode(input_ids)
                 input_processing_mode = "semantic"
             elif isinstance(input_ids, list) and input_ids and isinstance(input_ids[0], list):
-                # This is List[List[int]], meaning pre-chunked
                 new_chunks_from_input = [list(c) for c in input_ids]
-                new_tokens = [t for c in new_chunks_from_input for t in c]  # Flatten for full_tokens logic
+                new_tokens = [t for c in new_chunks_from_input for t in c]
                 input_processing_mode = "caller_exact"
-            else:  # List[int] or Tensor
+            else:
                 new_tokens = input_ids.tolist() if isinstance(input_ids, torch.Tensor) else list(input_ids)
                 input_processing_mode = "fixed"
 
-            if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: Mode={input_processing_mode}, new_tokens length={len(new_tokens)}", self.config.logfile)
+            num_new_tokens_for_this_call = len(new_tokens) # Set it here after parsing new_tokens
+
+            # self.total_seq_len = len(new_tokens) # This line was identified as problematic, effectively removed
+            if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: Mode={input_processing_mode}, new_tokens length={num_new_tokens_for_this_call}", self.config.logfile)
+
 
             trigger_update_cycle = False
             full_tokens_for_cycle: List[int] = []
-            chunks_for_cycle: List[List[int]] = []  # Chunks to be processed in the cycle
+            chunks_for_cycle: List[List[int]] = []
 
             is_likely_generation_step = isinstance(input_ids, list) and len(input_ids) == 1 and not isinstance(
-                input_ids[0], list)
+                input_ids[0], list) and not self.training # Added not self.training for clarity
 
             if input_processing_mode == "caller_exact":
                 trigger_update_cycle = True
                 full_tokens_for_cycle = [t for c in self.closed_chunks for t in
                                          c] + self.current_chunk_tokens + new_tokens
-                # For caller_exact, the input *is* the new chunks to add
                 chunks_for_cycle = self.closed_chunks + \
                                    ([self.current_chunk_tokens] if self.current_chunk_tokens else []) + \
                                    new_chunks_from_input
@@ -857,14 +956,15 @@ class CMAModel(nn.Module):
                                          c] + self.current_chunk_tokens + new_tokens
                 self.current_chunk_tokens = []
                 self.current_chunk_text = ""
-            elif self.current_chunk_tokens and not is_likely_generation_step and input_processing_mode in {"semantic",
-                                                                                                           "fixed"}:
+            # This condition was for training, to force cycle even if buffer not full.
+            # Let's ensure it only applies in training.
+            elif self.training and self.current_chunk_tokens and not is_likely_generation_step and input_processing_mode in {"semantic", "fixed"}:
                 trigger_update_cycle = True
                 full_tokens_for_cycle = [t for c in self.closed_chunks for t in
                                          c] + self.current_chunk_tokens + new_tokens
                 self.current_chunk_tokens = []
                 self.current_chunk_text = ""
-            else:  # Append to buffer, no cycle
+            else:
                 self.current_chunk_tokens.extend(new_tokens)
                 try:
                     decoded_new = self.tokenizer.decode(new_tokens)
@@ -872,14 +972,16 @@ class CMAModel(nn.Module):
                 except Exception as e:
                     print0(f"Warning: Error decoding appended tokens: {new_tokens}. Error: {e}", self.config.logfile)
 
-            # --- Perform update cycle OR process current chunk ---
-            num_new_tokens_for_this_call = len(new_tokens)
             if trigger_update_cycle:
                 if self.config.reset_memory_on_cycle:
-                    #if self.config.DEBUG_LEVEL > 0: print0("DEBUG: Resetting memory states for update cycle.", self.config.logfile)
                     self._initialize_memory_states(force_reset=True)
 
-                if input_processing_mode != "caller_exact":  # Re-chunk if not pre-chunked
+                # ---- SET current_total_logical_sequence_length for the cycle ----
+                self.current_total_logical_sequence_length = len(full_tokens_for_cycle)
+                if self.config.DEBUG_LEVEL > 0:
+                    print0(f"DEBUG CMAModel.forward: Cycle triggered. Logical seq_len set to {self.current_total_logical_sequence_length}", self.config.logfile)
+
+                if input_processing_mode != "caller_exact":
                     if not full_tokens_for_cycle:
                         chunks_for_cycle = []
                     elif input_processing_mode == "semantic":
@@ -890,78 +992,76 @@ class CMAModel(nn.Module):
                             print0(f"Error during semantic re-chunking: {e}. Falling back to fixed.", self.config.logfile)
                             chunks_for_cycle = self.chunk_processor.fixed_size_chunk_reverse_with_gap(
                                 full_tokens_for_cycle)
-                    else:
+                    else: # fixed
                         chunks_for_cycle = self.chunk_processor.fixed_size_chunk_reverse_with_gap(full_tokens_for_cycle)
 
                 if not chunks_for_cycle:
                     final_logits = torch.zeros(1, 0, self.vocab_size, device=dev)
-                    final_gate_loss = None  # No cycle, no gate loss from cycle
+                    final_gate_loss = None
                 else:
-                    # _trigger_memory_update_cycle ALWAYS returns ALL logits from Pass 2
                     all_cycle_logits, cycle_gate_loss = self._trigger_memory_update_cycle(chunks_for_cycle)
-                    # final_gate_loss for the call is the gate_loss from the cycle if one happened
-                    final_gate_loss = cycle_gate_loss
+                    if all_cycle_logits is not None:
+                        # num_new_tokens_for_this_call was defined earlier based on input_ids length
+                        if all_cycle_logits.size(1) >= num_new_tokens_for_this_call:
+                            final_logits = all_cycle_logits[:, -num_new_tokens_for_this_call:, :]
+                        else:
+                            # This case means the cycle produced fewer logits than the input sequence length.
+                            # This could happen if chunking resulted in fewer total tokens than original input,
+                            # or if input was very short.
+                            # Use all available logits and pad targets if necessary (or error, or log warning).
+                            # For now, just use what's available and let the outer loss handling deal with it,
+                            # but a warning is good.
+                            print0(
+                                f"Warning (CYCLE): All cycle logits len {all_cycle_logits.size(1)} < "
+                                f"num_new_tokens_for_this_call {num_new_tokens_for_this_call}. "
+                                f"Using all available cycle logits. Mode: {'TRAIN' if self.training else 'EVAL'}",
+                                self.config.logfile
+                            )
+                            final_logits = all_cycle_logits
+                            # If training, ensure targets are also sliced if this path is taken.
+                            # If eval, the targets are already sliced by the caller based on these logits.
+                    elif chunks_for_cycle:  # Cycle was triggered, chunks existed, but no logits (should be rare)
+                        final_logits = torch.zeros(1, 0, self.vocab_size, device=dev)
+                        print0(
+                            f"Warning (CYCLE): all_cycle_logits is None despite having chunks. "
+                            f"Mode: {'TRAIN' if self.training else 'EVAL'}",
+                            self.config.logfile
+                        )
+                    else:  # No chunks for cycle (e.g. empty input to cycle)
+                        final_logits = torch.zeros(1, 0, self.vocab_size, device=dev)
 
                     if self.training:
-                        if all_cycle_logits is not None and all_cycle_logits.size(1) >= num_new_tokens_for_this_call:
-                            final_logits = all_cycle_logits[:, -num_new_tokens_for_this_call:, :]
-                        elif all_cycle_logits is not None:
-                            print0(
-                                f"Warning (TRAIN CYCLE): All cycle logits len {all_cycle_logits.size(1)} < num_new_tokens {num_new_tokens_for_this_call}. Using all available cycle logits.", self.config.logfile)
-                            final_logits = all_cycle_logits  # This fallback might lead to target mismatch if len(all_cycle_logits) < num_new_tokens_for_this_call
-                        else:
-                            final_logits = torch.zeros(1, 0, self.vocab_size, device=dev)
-                    else:  # Evaluation mode AND cycle was triggered
-                        if all_cycle_logits is not None and self.current_chunk_tokens and len(
-                                self.current_chunk_tokens) > 0:
-                            len_last_chunk = len(self.current_chunk_tokens)
-                            if all_cycle_logits.size(1) >= len_last_chunk:
-                                final_logits = all_cycle_logits[:, -len_last_chunk:, :]
-                            else:
-                                print0(
-                                    f"Warning (EVAL CYCLE): All cycle logits len {all_cycle_logits.size(1)} < len last_chunk {len_last_chunk}. Using all available cycle logits.", self.config.logfile)
-                                final_logits = all_cycle_logits  # Fallback
-                        elif all_cycle_logits is not None:  # current_chunk_tokens is empty/None, but we have cycle_logits
-                            print0(
-                                f"Warning (EVAL CYCLE): current_chunk_tokens is empty/None after cycle. Returning all cycle_logits as fallback.", self.config.logfile)
-                            final_logits = all_cycle_logits
-                        else:
-                            final_logits = torch.zeros(1, 0, self.vocab_size, device=dev)
-                        # For eval, ensure final_gate_loss is None as per CMATrainingHelper expectation
-                        final_gate_loss = None
-            else:
-                if self.current_chunk_tokens:  # current_chunk_tokens contains HISTORY_BUFFER + new_tokens just added
+                        final_gate_loss = cycle_gate_loss  # Keep gate loss from cycle for training
+                    else:
+                        final_gate_loss = None  # No gate loss for eval output after cycle
+
+            else: # No cycle
+                # ---- SET current_total_logical_sequence_length for current chunk processing ----
+                self.current_total_logical_sequence_length = sum(len(c) for c in self.closed_chunks) + len(self.current_chunk_tokens)
+                if self.config.DEBUG_LEVEL > 0:
+                    print0(f"DEBUG CMAModel.forward: No cycle. Logical seq_len for current chunk set to {self.current_total_logical_sequence_length}", self.config.logfile)
+
+                if self.current_chunk_tokens:
                     logits_full_buffer, gate_loss_chunk = self._process_current_chunk(
                         generation_mode=(not self.training and is_likely_generation_step)
                     )
-
                     if self.training:
-                        # We need logits only for the 'new_tokens' part of the buffer
                         if logits_full_buffer.size(1) > 0 and num_new_tokens_for_this_call > 0:
-                            # new_tokens are at the end of current_chunk_tokens
-                            # This assumes current_chunk_tokens = previous_buffer + new_tokens
-                            # And logits_full_buffer corresponds to all of current_chunk_tokens
                             if logits_full_buffer.size(1) >= num_new_tokens_for_this_call:
                                 final_logits = logits_full_buffer[:, -num_new_tokens_for_this_call:, :]
                             else:
-                                # This implies current_chunk_tokens (and thus logits_full_buffer) is shorter
-                                # than new_tokens, which is odd if new_tokens were just appended.
-                                # Or, new_tokens were empty, num_new_tokens_for_this_call is 0.
-                                # If num_new_tokens_for_this_call is 0, slicing with -0: gives empty.
                                 print0(
                                     f"Warning (TRAIN NO CYCLE): Buffer logits len {logits_full_buffer.size(1)} vs num_new_tokens {num_new_tokens_for_this_call}. Slicing with -{num_new_tokens_for_this_call}:", self.config.logfile)
-                                final_logits = logits_full_buffer[:, -num_new_tokens_for_this_call:,
-                                               :]  # Handles num_new_tokens_for_this_call=0
-                        elif num_new_tokens_for_this_call == 0:  # No new tokens, but buffer might have old content. Return empty logits for loss.
+                                final_logits = logits_full_buffer[:, -num_new_tokens_for_this_call:, :]
+                        elif num_new_tokens_for_this_call == 0:
                             final_logits = torch.zeros(1, 0, self.vocab_size, device=dev)
-                        else:  # Buffer is empty, or new_tokens is empty and buffer was already empty
+                        else:
                             final_logits = torch.zeros(1, 0, self.vocab_size, device=dev)
-
-                        final_gate_loss = gate_loss_chunk  # Gate loss from processing the buffer
-                    else:  # Evaluation, no cycle
+                        final_gate_loss = gate_loss_chunk
+                    else: # Evaluation, no cycle
                         final_logits = logits_full_buffer
-                        final_gate_loss = None
-                else:  # No current_chunk_tokens and no cycle
+                        final_gate_loss = None # No gate loss for eval output
+                else:
                     final_logits = torch.zeros(1, 0, self.vocab_size, device=dev)
                     final_gate_loss = None
 
@@ -975,7 +1075,7 @@ class CMAModel(nn.Module):
 
         if self.training:
             # Existing slicing logic for cycle or no-cycle path leads to final_logits
-            if self.config.DEBUG_LEVEL > 0 and self.training_step < 5:  # Assuming 'step' is available or use self.training_step
+            if self.config.DEBUG_LEVEL > 0 and self.training_step < 5:
                 expected_len = num_new_tokens_for_this_call  # This was len(new_tokens)
                 if final_logits.shape[1] != expected_len:
                     print0(
@@ -986,80 +1086,86 @@ class CMAModel(nn.Module):
                         f"DEBUG CMAModel.forward (TRAIN): Step {self.training_step}, OK final_logits len {final_logits.shape[1]} == expected new_tokens len {expected_len}. Cycle was {trigger_update_cycle}.",
                         logfile=self.config.logfile)
 
+        if not self.training and final_logits is not None:
+            expected_len_val = num_new_tokens_for_this_call
+            actual_len_val = final_logits.shape[1]
+            is_mismatch = expected_len_val != actual_len_val
+            status_msg = "MISMATCH" if is_mismatch else "OK"
+            len_last_chunk_val = len(
+                self.current_chunk_tokens) if trigger_update_cycle and self.current_chunk_tokens else 'N/A'
+
+            print0(
+                f"DEBUG CMAModel.forward (VALIDATION): Step {self.training_step}, {status_msg} final_logits len {actual_len_val} vs. input_ids len {expected_len_val}. "
+                f"Cycle: {trigger_update_cycle}. len_last_chunk: {len_last_chunk_val}. Closed chunks: {len(self.closed_chunks)}.",
+                logfile=self.config.logfile
+            )
+        if final_logits is not None:
+            log_msg_prefix = "[TRAIN]" if self.training else "[VAL]"
+            if not self.training and final_logits is not None:
+                print0(f"DEBUG CMAModel.forward {log_msg_prefix}: "
+                       f"Logits len={final_logits.shape[1]}, num_new_tokens_for_this_call (original input len for this call)={num_new_tokens_for_this_call}. "
+                       f"Cycle triggered={trigger_update_cycle}. If cycle, current_chunk_tokens len={len(self.current_chunk_tokens) if self.current_chunk_tokens else 'N/A'}",
+                       self.config.logfile)
+            elif self.training and final_logits is not None and self.config.DEBUG_LEVEL > 0:
+                print0(
+                    f"DEBUG CMAModel.forward (TRAIN): Step {self.training_step}, OK final_logits len {final_logits.shape[1]} == expected new_tokens len {num_new_tokens_for_this_call}. Cycle was {trigger_update_cycle}.",
+                    logfile=self.config.logfile)
+
         # final_gate_loss is now the aggregated gate loss from the relevant path
         # (either cycle Pass 2 if training, or _process_current_chunk if training and no cycle)
         return final_logits, final_gate_loss
 
     def _process_current_chunk(self, generation_mode: bool = False) -> Tuple[
-        torch.Tensor, Optional[torch.Tensor]]:  # Updated return signature
-        """
-        Processes the current chunk buffer for logits.
-        Returns logits and accumulated gate loss for this chunk.
-        """
+        torch.Tensor, Optional[torch.Tensor]]:
         if not self.current_chunk_tokens:
-            # No loss if no tokens
             return torch.zeros(1, 0, self.vocab_size, device=self.token_embedding.weight.device), None
         dev = self.token_embedding.weight.device
 
         chunk_idx = len(self.closed_chunks)
-        total_chunks_in_history = chunk_idx + 1
-        # Ensure current_chunk_tokens is not empty before creating tensor
-        if not self.current_chunk_tokens:
-            # This case should be caught above, but double-check
-            return torch.zeros(1, 0, self.vocab_size, device=dev), None
+        total_chunks_in_history = chunk_idx + 1  # For control token ratio
 
-        chunk_tensor = torch.tensor(self.current_chunk_tokens, device=dev, dtype=torch.long).unsqueeze(0)  # (1, T)
-        #B, T = chunk_tensor.shape
-        x = self.token_embedding(chunk_tensor)  # (1, T, D)
+        # current_total_logical_sequence_length is set by the caller (CMAModel.forward or generate)
 
-        approx_processed_len = sum(len(c) for c in self.closed_chunks)
-        current_mem_size = self.memory_manager.get_effective_size(approx_processed_len)
-        # Determine mode for control tokens and layer processing
-        mode = "generate" if generation_mode else "forward"  # Or could be a specific training mode
+        chunk_tensor = torch.tensor(self.current_chunk_tokens, device=dev, dtype=torch.long).unsqueeze(0)
+        x = self.token_embedding(chunk_tensor)
+
+        approx_processed_len_for_ctrl_tokens = sum(len(c) for c in self.closed_chunks)  # History before current chunk
+        current_mem_size_for_ctrl_tokens = self.memory_manager.get_effective_size(approx_processed_len_for_ctrl_tokens)
+
+        mode = "generate" if generation_mode else "forward"
         ctrl = self.control_token_generator.generate_control_tokens(
             mode=mode,
             current_chunk_idx=chunk_idx, total_chunks=total_chunks_in_history,
-            current_mem_size=current_mem_size, max_mem_size=self.config.max_memory_size,
-            seq_len=approx_processed_len
+            current_mem_size=current_mem_size_for_ctrl_tokens, max_mem_size=self.config.max_memory_size,
+            seq_len=approx_processed_len_for_ctrl_tokens
         )
 
-        # Use copies of state dicts to pass to layers if needed, or pass self.M_* directly
-        # Passing self.M_* directly is fine as Block.forward reads from them
         M_fwd = self.M_fwd
-        M_rev_ahead = self.M_rev_ahead  # Not used in generation/forward processing chunk
+        M_rev_ahead = self.M_rev_ahead
         M_rev_persist = self.M_rev_persist
-        aggregated_gate_loss: Optional[torch.Tensor] = None  # Initialize accumulator for this chunk
+        aggregated_gate_loss: Optional[torch.Tensor] = None
 
-        # --- Layer processing loop (Accumulate gate loss) ---
-        for layer_idx, layer in enumerate(self.layers):
+        for layer_idx, layer_block in enumerate(self.layers):  # Renamed 'layer' to 'layer_block'
             group_idx = self.layer_idx_to_group_idx[layer_idx]
 
-            x, updated_fwd, updated_rev, gate_loss = layer(  # Capture gate_loss
+            x, updated_fwd, updated_rev, gate_loss = layer_block(  # Use 'layer_block'
                 x,
                 M_fwd_dict=M_fwd, M_rev_ahead_dict=M_rev_ahead, M_rev_persist_dict=M_rev_persist,
                 group_id=group_idx, mode=mode, control_tokens=ctrl,
-                write_mask=None, decay_weights=None  # No updates expected here
+                write_mask=None, decay_weights=None,
+                # ---- PASS THE CORRECT logical sequence length ----
+                total_logical_sequence_length=self.current_total_logical_sequence_length
             )
 
-            # Accumulate gate loss if returned
             if gate_loss is not None:
-                # Ensure loss is a scalar or sum appropriately if per-head/token
                 current_loss = gate_loss.mean() if gate_loss.numel() > 1 else gate_loss
                 if aggregated_gate_loss is None:
                     aggregated_gate_loss = current_loss
                 else:
-                    aggregated_gate_loss += current_loss  # Simple sum across layers
-
-            # --- Handle state updates (should be None in this mode) ---
-            if updated_fwd is not None: print0(
-                f"Warning: Fwd memory updated unexpectedly in mode '{mode}' for group {updated_fwd[0]}", self.config.logfile)
-            if updated_rev is not None: print0(
-                f"Warning: Rev memory updated unexpectedly in mode '{mode}' for group {updated_rev[0]}", self.config.logfile)
+                    aggregated_gate_loss += current_loss
 
         x = norm(x)
         logits = self.lm_head(x)
-
-        # Return logits and the accumulated gate loss for this chunk
         return logits, aggregated_gate_loss
 
     def _print_memory_stats(self, memory_dict: Dict[int, Tensor], pass_name: str, chunk_idx: Optional[int] = None):
@@ -1091,92 +1197,109 @@ class CMAModel(nn.Module):
             self,
             chunks: List[List[int]]
     ) -> Tuple[
-        Optional[torch.Tensor], Optional[torch.Tensor]]:  # (Optional[all_pass2_logits], Optional[pass2_gate_loss])
-        """
-        Processes the full sequence of chunks through the 3-pass cycle.
-        If return_all_pass2_logits is True, returns concatenated logits from Pass 2
-        and its aggregated gate loss. Otherwise, returns (None, pass2_gate_loss_if_any).
-        """
-        if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: Starting _trigger_memory_update_cycle with {len(chunks)} chunks", self.config.logfile)
+        Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if self.config.DEBUG_LEVEL > 0: print0(
+            f"DEBUG: Starting _trigger_memory_update_cycle with {len(chunks)} chunks", self.config.logfile)
         if not chunks:
             return None, None
 
         dev = self.token_embedding.weight.device
-        B = 1  # Assuming batch size 1 for stateful processing
+        B = 1
+
+        # self.current_total_logical_sequence_length is set by CMAModel.forward before calling this.
+        # It represents sum(len(c) for c in chunks).
 
         # --- Pass 1: Lookahead Reverse ---
         try:
-            M_rev_ahead_computed = self._run_lookahead_reverse_pass(chunks, B, dev)
+            M_rev_ahead_computed = self._run_lookahead_reverse_pass(chunks, B, dev,
+                                                                    self.current_total_logical_sequence_length)
             self._print_memory_stats(M_rev_ahead_computed, "LookaheadReverse (Output)")
         except Exception as e:
             print0(f"ERROR in _run_lookahead_reverse_pass: {e}", self.config.logfile)
             raise
 
-        # --- Pass 2: Forward ---
         pass2_new_tokens_logits_list: List[torch.Tensor] = []
         pass2_gate_loss_aggregated: Optional[torch.Tensor] = None
 
-        tokens_processed_before_cycle = self.total_tokens_processed  # For get_effective_size
-        current_total_processed_for_pass2 = tokens_processed_before_cycle
-        processed_tokens_count_in_pass2 = 0
+        # For control tokens and write masks in Pass 2, we need tokens processed *before* the current chunk in *this pass*
+        tokens_processed_in_pass2_before_current_chunk = 0
 
         self._print_memory_stats(self.M_fwd, "Forward (Input to Pass 2)")
-        self._print_memory_stats(self.M_rev_persist, "PersistentReverse (Input to Pass 2)")
+        # M_rev_persist is used for attention in Pass 2. M_rev_ahead_computed is also passed but Block logic will select M_rev_persist.
+        self._print_memory_stats(self.M_rev_persist, "PersistentReverse (Input to Pass 2 for attention)")
 
         for chunk_idx, chunk_tokens in enumerate(chunks):
-            if not chunk_tokens: continue  # Skip empty chunks
+            if not chunk_tokens: continue
 
             chunk_tensor = torch.tensor(chunk_tokens, dtype=torch.long, device=dev).unsqueeze(0)
-            x = self.token_embedding(chunk_tensor)  # (B, T_chunk, D)
+            x = self.token_embedding(chunk_tensor)
 
-            # Control tokens for this chunk in Pass 2
-            current_mem_size = self.memory_manager.get_effective_size(current_total_processed_for_pass2)
+            # Control tokens for Pass 2
+            # seq_len for control tokens should be tokens processed *before* this chunk in this pass.
+            current_mem_size_for_ctrl = self.memory_manager.get_effective_size(
+                self.total_tokens_processed + tokens_processed_in_pass2_before_current_chunk)
             ctrl = self.control_token_generator.generate_control_tokens(
                 mode="forward", current_chunk_idx=chunk_idx, total_chunks=len(chunks),
-                current_mem_size=current_mem_size, max_mem_size=self.config.max_memory_size,
-                seq_len=current_total_processed_for_pass2
+                current_mem_size=current_mem_size_for_ctrl, max_mem_size=self.config.max_memory_size,
+                seq_len=self.total_tokens_processed + tokens_processed_in_pass2_before_current_chunk
             )
 
-            # Determine M_rev_persist to use for this chunk (masking if training)
             M_rev_persist_for_chunk: Dict[int, Tensor]
             if self.training and self.config.enable_mask_future_dropout:
                 p_drop = get_mask_future_schedule(self.config, self.training_step, self.total_training_steps)
+                if self.config.DEBUG_LEVEL > 0:
+                    print0(f"DEBUG MASKING: Training step {self.training_step}, M_rev_persist p_drop: {p_drop:.4f}",
+                           self.config.logfile)
                 M_rev_persist_for_chunk = self._mask_persistent_memory(self.M_rev_persist, p_drop)
-                if chunk_idx == 0:  # Print only for the first chunk to avoid too much log
+                if chunk_idx == 0 and self.config.DEBUG_LEVEL > 1:
                     self._print_memory_stats(M_rev_persist_for_chunk, "PersistentReverse (Masked for Pass 2)",
                                              chunk_idx=chunk_idx)
             else:
+                p_drop = 0.0
                 M_rev_persist_for_chunk = self.M_rev_persist
+                if not self.training and self.config.enable_mask_future_dropout:
+                    print0(
+                        f"DEBUG MASKING: Validation (step {self.training_step}), M_rev_persist p_drop: N/A (masking disabled for eval)",
+                        self.config.logfile)
 
             chunk_gate_loss_accumulator_for_layers: Optional[torch.Tensor] = None
 
-            for layer_idx, layer_block in enumerate(self.layers):  # Changed 'layer' to 'layer_block'
+            for layer_idx, layer_block in enumerate(self.layers):
                 group_idx = self.layer_idx_to_group_idx[layer_idx]
                 group = self.layer_groups[group_idx]
-
                 wmask = None
-                # Write mask for memory_update layers in this group
                 if group.has_memory and layer_idx == group.memory_update_layer_idx:
                     wmask = self.memory_manager.get_write_mask(
                         current_chunk_idx_in_pass=chunk_idx,
                         total_chunks_in_pass=len(chunks),
-                        total_tokens_processed_before_chunk=current_total_processed_for_pass2,
+                        # total_tokens_processed_before_chunk for write_mask should be global history + progress in current pass
+                        total_tokens_processed_before_chunk=self.total_tokens_processed + tokens_processed_in_pass2_before_current_chunk,
                         current_chunk_len=len(chunk_tokens),
                         batch_size=B, device=dev
                     )
+                if not self.training and chunk_idx == 0 and wmask is not None and self.config.DEBUG_LEVEL > 0:
+                    print0(f"DEBUG VAL First Write Mask (Pass 2, Chunk 0): "
+                           f"true_frac={wmask.float().mean().item():.4f}, "
+                           f"shape={wmask.shape}, "
+                           f"total_tokens_processed_before_chunk={self.total_tokens_processed + tokens_processed_in_pass2_before_current_chunk}",
+                           self.config.logfile)
 
-                # Process layer
                 x, updated_fwd, _, layer_gate_loss = layer_block(
                     x, M_fwd_dict=self.M_fwd, M_rev_ahead_dict=M_rev_ahead_computed,
-                    M_rev_persist_dict=M_rev_persist_for_chunk,  # Use potentially masked
+                    # M_rev_ahead is passed for potential other uses
+                    M_rev_persist_dict=M_rev_persist_for_chunk,  # This will be selected by Block for mode="forward"
                     group_id=group_idx, mode="forward", control_tokens=ctrl,
-                    write_mask=wmask, decay_weights=None
+                    write_mask=wmask, decay_weights=None,
+                    total_logical_sequence_length=self.current_total_logical_sequence_length  # Corrected
                 )
-
+                if chunk_idx == 0 and self.config.DEBUG_LEVEL > 0:  # Print for first chunk of sequence
+                    self._print_memory_stats(M_rev_persist_for_chunk,
+                                             f"PersistentReverse ({'Masked' if self.training and self.config.enable_mask_future_dropout and p_drop > 0 else 'Unmasked'} for Pass 2 Attn)",
+                                             chunk_idx=chunk_idx)
 
                 if updated_fwd is not None:
                     g_id, mem = updated_fwd
-                    self.M_fwd[g_id] = mem  # Update self.M_fwd directly
+                    self.M_fwd[g_id] = mem
                     if layer_idx == group.memory_update_layer_idx and \
                             (chunk_idx == 0 or chunk_idx == len(chunks) - 1) and \
                             self.config.DEBUG_LEVEL > 1:
@@ -1189,45 +1312,49 @@ class CMAModel(nn.Module):
                     else:
                         chunk_gate_loss_accumulator_for_layers += current_loss
 
-            # After processing chunk through all layers:
-            # x is now the output for this chunk (B, T_chunk, D)
-            # Apply final norm and lm_head to get logits for this chunk
-            logits_for_chunk = self.lm_head(norm(x))  # (B, T_chunk, VocabSize)
-
+            logits_for_chunk = self.lm_head(norm(x))
             pass2_new_tokens_logits_list.append(logits_for_chunk)
 
-            if chunk_gate_loss_accumulator_for_layers is not None:  # This is loss for ONE chunk
+            if chunk_gate_loss_accumulator_for_layers is not None:
                 if pass2_gate_loss_aggregated is None:
                     pass2_gate_loss_aggregated = chunk_gate_loss_accumulator_for_layers
                 else:
                     pass2_gate_loss_aggregated += chunk_gate_loss_accumulator_for_layers
 
-            current_total_processed_for_pass2 += len(chunk_tokens)
-            processed_tokens_count_in_pass2 += len(chunk_tokens)
+            tokens_processed_in_pass2_before_current_chunk += len(chunk_tokens)
 
         self._print_memory_stats(self.M_fwd, "Forward (Output of Pass 2)")
-        # Clear temporary lookahead memory
-        del M_rev_ahead_computed
-        self.M_rev_ahead = {}
+        del M_rev_ahead_computed  # Temporary
+        self.M_rev_ahead = {}  # Clear runtime state
 
         # --- Pass 3: Persistent Reverse ---
         self._print_memory_stats(self.M_rev_persist, "PersistentReverse (Input to Pass 3)")
-        self._run_persistent_reverse_pass(chunks, B, dev)  # This updates self.M_rev_persist
+        self._run_persistent_reverse_pass(chunks, B, dev, self.current_total_logical_sequence_length)
         self._print_memory_stats(self.M_rev_persist, "PersistentReverse (Output of Pass 3)")
 
+        self.closed_chunks = chunks[:-1]
+        self.current_chunk_tokens = chunks[-1] if chunks else []
         # Update model state after successful cycle
         self.closed_chunks = chunks[:-1]
         self.current_chunk_tokens = chunks[-1] if chunks else []
-        new_total_tokens = sum(len(c) for c in chunks)
-        self.total_tokens_processed = new_total_tokens  # Update based on chunks processed in this cycle
-        self.tokens_since_persistent_update = 0
+
+        # When reset_memory_on_cycle is False, 'chunks' represents the re-chunked entirety
+        # of all historical tokens plus new tokens. So, its total length IS the new
+        # total_tokens_processed.
+        # When reset_memory_on_cycle is True, self.total_tokens_processed would have been 0
+        # (or reset by _initialize_memory_states if that were called before this point,
+        # but CMAModel.forward handles the _initialize_memory_states reset).
+        # The key is that `chunks` argument to this function is the definitive list of all
+        # tokens considered for this cycle.
+        self.total_tokens_processed = sum(len(c) for c in chunks)
+
+        self.tokens_since_persistent_update = 0  # Reset as persistent was just run (or attempted)
 
         concatenated_pass2_logits: Optional[torch.Tensor] = None
-        if pass2_new_tokens_logits_list:  # pass2_new_tokens_logits_list now contains all logits from all chunks in pass 2
+        if pass2_new_tokens_logits_list:
             concatenated_pass2_logits = torch.cat(pass2_new_tokens_logits_list, dim=1)
-        elif chunks:  # Chunks existed but maybe were all empty, resulting in empty pass2_logits_list
+        elif chunks:
             concatenated_pass2_logits = torch.zeros(B, 0, self.vocab_size, device=dev)
-        # else (no chunks at all), it remains None, handled by caller
 
         return concatenated_pass2_logits, pass2_gate_loss_aggregated
 
@@ -1301,13 +1428,15 @@ class CMAModel(nn.Module):
         # Update total tokens processed *after* successfully processing the chunk
         self.total_tokens_processed += chunk_tensor.size(1)
 
-    def _run_lookahead_reverse_pass(self, all_chunks: List[List[int]], B: int, dev: torch.device) -> Dict[int, Tensor]:
+    def _run_lookahead_reverse_pass(self, all_chunks: List[List[int]], B: int, dev: torch.device, total_logical_sequence_length: int) -> Dict[int, Tensor]:
         try:
             """ Runs the lookahead reverse pass. """
             n_chunks = len(all_chunks)
             window_start_idx = max(0, n_chunks - self.config.reverse_max_chunks)
             reverse_window_chunks = all_chunks[window_start_idx:]
             window_size = len(reverse_window_chunks)
+            approx_processed_len_for_ctrl_tokens = self.total_tokens_processed
+            current_mem_size_for_ctrl = self.memory_manager.get_effective_size(approx_processed_len_for_ctrl_tokens)
 
             if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: Entering _run_lookahead_reverse_pass. n_chunks={n_chunks}, window_size={window_size}", self.config.logfile)
 
@@ -1324,7 +1453,7 @@ class CMAModel(nn.Module):
                     mem_idx = self.group_id_to_memory_idx[group_idx]
                     #if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: Initializing memory for group {group_idx}", self.config.logfile)
 
-                    param = self.initial_rev_s_params[mem_idx]
+                    param = self.initial_rev_la_params[mem_idx]
                     #if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: Parameter shape: {param.shape}, device: {param.device}", self.config.logfile)
 
                     current_M_rev_ahead[group_idx] = param.clone().to(dev).repeat(B, 1, 1)
@@ -1353,15 +1482,16 @@ class CMAModel(nn.Module):
                 current_mem_size = self.memory_manager.get_effective_size(approx_processed_len)
                 ctrl = self.control_token_generator.generate_control_tokens(
                     mode="lookahead_reverse", current_chunk_idx=global_chunk_idx, total_chunks=n_chunks,
-                    current_mem_size=current_mem_size, max_mem_size=self.config.max_memory_size,
-                    seq_len=approx_processed_len, reverse_chunk_idx=reverse_chunk_idx, reverse_window_size=window_size
+                    current_mem_size=current_mem_size_for_ctrl, max_mem_size=self.config.max_memory_size,
+                    seq_len=approx_processed_len_for_ctrl_tokens, # Use global history for ratios
+                    reverse_chunk_idx=reverse_chunk_idx, reverse_window_size=window_size
                 )
 
                 # Pass state dictionaries to layers
                 M_fwd = self.M_fwd  # Pass empty or existing state (not used by layers in this mode)
                 M_rev_persist = self.M_rev_persist  # Pass existing state (not used by layers in this mode)
 
-                for layer_idx, layer in enumerate(self.layers):
+                for layer_idx, layer_block in enumerate(self.layers):
                     group_idx = self.layer_idx_to_group_idx[layer_idx]
                     group = self.layer_groups[group_idx]
 
@@ -1374,16 +1504,17 @@ class CMAModel(nn.Module):
                             is_persistent=False, memory_shape=mem_shape, device=dev
                         )
 
-                    x, _, updated_rev, _gate_loss = layer(  # Expect only updated_rev
+                    x, _, updated_rev, _gate_loss = layer_block(  # Expect only updated_rev
                         x,
                         M_fwd_dict=M_fwd,
-                        M_rev_ahead_dict=current_M_rev_ahead,  # Pass the dict being updated
+                        M_rev_ahead_dict=current_M_rev_ahead,
                         M_rev_persist_dict=M_rev_persist,
                         group_id=group_idx,
                         mode="lookahead_reverse",
                         control_tokens=ctrl,
                         write_mask=None,
-                        decay_weights=decay  # Pass calculated decay
+                        decay_weights=decay,
+                        total_logical_sequence_length=total_logical_sequence_length  # MODIFIED: Pass through
                     )
 
                     # Update the local state dict for the next layer
@@ -1398,7 +1529,7 @@ class CMAModel(nn.Module):
             traceback.print_exc()
             raise
 
-    def _run_persistent_reverse_pass(self, all_chunks: List[List[int]], B: int, dev: torch.device):
+    def _run_persistent_reverse_pass(self, all_chunks: List[List[int]], B: int, dev: torch.device, total_logical_sequence_length: int):
         """ Runs the persistent reverse pass. """
         n_chunks = len(all_chunks)
         # Eligible chunks for persistent reverse are all except the last one
@@ -1411,6 +1542,8 @@ class CMAModel(nn.Module):
         window_start_idx = max(0, len(eligible_chunks) - self.config.reverse_max_chunks)
         reverse_window_chunks = eligible_chunks[window_start_idx:]
         window_size = len(reverse_window_chunks)
+        approx_processed_len_for_ctrl_tokens = self.total_tokens_processed
+        current_mem_size_for_ctrl = self.memory_manager.get_effective_size(approx_processed_len_for_ctrl_tokens)
 
         if not reverse_window_chunks:
             print0("  Skipping Persistent Reverse Pass: Window is empty after eligibility check.", self.config.logfile)
@@ -1450,15 +1583,15 @@ class CMAModel(nn.Module):
             current_mem_size = self.memory_manager.get_effective_size(approx_processed_len)
             ctrl = self.control_token_generator.generate_control_tokens(
                 mode="persistent_reverse",
-                current_chunk_idx=global_chunk_idx_in_all,  # Use index relative to all chunks
-                total_chunks=n_chunks,  # Total chunks in the sequence
-                current_mem_size=current_mem_size, max_mem_size=self.config.max_memory_size,
-                seq_len=approx_processed_len,
-                reverse_chunk_idx=reverse_chunk_idx,  # Index within the processing window
+                current_chunk_idx=global_chunk_idx_in_all,
+                total_chunks=n_chunks,
+                current_mem_size=current_mem_size_for_ctrl, max_mem_size=self.config.max_memory_size,
+                seq_len=approx_processed_len_for_ctrl_tokens,  # Use global history for ratios
+                reverse_chunk_idx=reverse_chunk_idx,
                 reverse_window_size=window_size
             )
 
-            for layer_idx, layer in enumerate(self.layers):
+            for layer_idx, layer_block in enumerate(self.layers):
                 group_idx = self.layer_idx_to_group_idx[layer_idx]
                 group = self.layer_groups[group_idx]
 
@@ -1475,16 +1608,17 @@ class CMAModel(nn.Module):
                         # Should not happen if initialized correctly
                         print0(f"Warning: Group {group_idx} not found in current_M_rev_persist during decay calc.", self.config.logfile)
 
-                x, _, updated_rev, _gate_loss = layer(
+                x, _, updated_rev, _gate_loss = layer_block(
                     x,
                     M_fwd_dict=M_fwd,
                     M_rev_ahead_dict=M_rev_ahead,
-                    M_rev_persist_dict=current_M_rev_persist,  # Pass dict holding state to update
+                    M_rev_persist_dict=current_M_rev_persist,
                     group_id=group_idx,
                     mode="persistent_reverse",
                     control_tokens=ctrl,
                     write_mask=None,
-                    decay_weights=decay
+                    decay_weights=decay,
+                    total_logical_sequence_length=total_logical_sequence_length
                 )
 
                 if updated_rev is not None:
@@ -1546,58 +1680,64 @@ class CMAModel(nn.Module):
 
         # --- State Initialization ---
         generated: List[int] = []
-        # Process initial prompt if provided. This updates self.current_chunk_tokens.
+        # Process initial prompt. CMAModel.forward will set self.current_total_logical_sequence_length internally.
         if prompt not in (None, "", [], torch.tensor([], dtype=torch.long)):
-            if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: Processing initial prompt ({type(prompt)})", self.config.logfile)
-            _ = self.forward(prompt, training_mode=False)  # Process prompt, update state
-            if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: After prompt processing, current_chunk_tokens len: {len(self.current_chunk_tokens)}", self.config.logfile)
-        else:
-            if self.config.DEBUG_LEVEL > 0: print0("DEBUG: No initial prompt provided.", self.config.logfile)
+            if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: Processing initial prompt ({type(prompt)})",
+                                                   self.config.logfile)
+            _ = self.forward(prompt, training_mode=False)  # CMAModel.forward sets its internal logical length
+            if self.config.DEBUG_LEVEL > 0: print0(
+                f"DEBUG: After prompt processing, current_chunk_tokens len: {len(self.current_chunk_tokens)}",
+                self.config.logfile)
+        # else: self.current_total_logical_sequence_length remains 0 or its value from a previous call if not reset_state
 
-        # Update text buffer based on initial state (prompt or empty)
         try:
             self.current_chunk_text = self.tokenizer.decode(self.current_chunk_tokens)
         except Exception as e:
             print0(f"Warning: Error decoding initial buffer tokens: {e}", self.config.logfile)
             self.current_chunk_text = ""
 
-        # This variable will hold the single token input for the next forward pass
         current_token_input: Optional[List[int]] = None
 
-        # --- Generation Loop ---
         for i in range(max_new_tokens):
-            if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: Generation step {i + 1}/{max_new_tokens}", self.config.logfile)
-
-            # Get logits. The input is None for the first step (using prompt state),
-            # or the previously generated token for subsequent steps.
-            if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: Calling forward with input: {current_token_input}", self.config.logfile)
+            # CMAModel.forward will correctly determine and use self.current_total_logical_sequence_length
+            # based on current_token_input and existing state (closed_chunks, current_chunk_tokens)
+            if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: Calling forward with input: {current_token_input}",
+                                                   self.config.logfile)
             logits, _gate_loss = self.forward(current_token_input, training_mode=False)
             # Note: forward() internally updates self.current_chunk_tokens if current_token_input is not None
             if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: After forward, current_chunk_tokens len: {len(self.current_chunk_tokens)}", self.config.logfile)
 
-            # Check if generation should stop (e.g., empty logits from model)
+            # --- TEMPORARILY COPYING THE SAMPLING LOGIC HERE TO ENSURE `next_id` is available ---
             if logits.shape[1] == 0:
-                if self.config.DEBUG_LEVEL > 1: print0("INFO: Generation stopped - empty logits received from forward pass.", self.config.logfile)
+                if self.config.DEBUG_LEVEL > 1: print0("INFO: Generation stopped - empty logits.", self.config.logfile)
+                current_token_input = None  # To skip final forward
                 break
 
-            # Sample the next token ID from the last position's logits
-            next_id = _sample_row(logits[0, -1, :])
+            # Helper function for sampling (assuming it's defined or copied here if not accessible)
+            def _sample_row_local(row: torch.Tensor) -> int:
+                row = row.float()
+                if top_k is not None and top_k > 0:
+                    actual_k = min(top_k, row.shape[-1])
+                    if actual_k > 0:
+                        thresh = torch.topk(row, actual_k).values[-1]
+                        row = torch.where(row < thresh, torch.full_like(row, float("-inf")), row)
+                temp = max(float(temperature), 1e-5)
+                probs = torch.nn.functional.softmax(row / temp, dim=-1)
+                return torch.multinomial(probs, 1).item()
+
+            next_id = _sample_row_local(logits[0, -1, :])
+            # --- END OF TEMPORARY SAMPLING LOGIC COPY --
             if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: Sampled token ID: {next_id}", self.config.logfile)
 
             generated.append(next_id)
 
             # Check for stop token
             if stop_token_id is not None and next_id == stop_token_id:
-                if self.config.DEBUG_LEVEL > 1: print0(f"INFO: Stop token {stop_token_id} generated. Stopping.", self.config.logfile)
-                # We break *before* setting current_token_input, so the final state reflects up to the token *before* the stop token.
-                # Set current_token_input to None so the final forward pass doesn't run.
-                current_token_input = None
-                break  # Now the token has already been appended
+                if self.config.DEBUG_LEVEL > 1: print0(f"INFO: Stop token {stop_token_id} generated. Stopping.",
+                                                       self.config.logfile)
+                current_token_input = None  # Skip final forward
+                break
 
-            # --- Original position of generated.append(next_id) removed ---
-            # generated.append(next_id) # <-- REMOVED FROM HERE
-
-            # Update text buffer (optional, mainly for debugging or semantic checks)
             try:
                 self.current_chunk_text += self.tokenizer.decode([next_id])
             except Exception as e:
@@ -1606,53 +1746,61 @@ class CMAModel(nn.Module):
             # --- Periodic Persistent Reverse Update Check ---
             self.tokens_since_persistent_update += 1
             update_persist = False
-            # Check token frequency
             if self.config.persistent_reverse_update_freq_tokens is not None and \
                     self.tokens_since_persistent_update >= self.config.persistent_reverse_update_freq_tokens:
                 update_persist = True
-            # Check semantic frequency (if token check didn't trigger)
             if not update_persist and self.config.persistent_reverse_update_freq_semantic and len(
                     self.current_chunk_text) > 1:
+                # ... (semantic boundary check logic) ...
                 try:
                     boundary_level = self.config.persistent_reverse_update_freq_semantic
                     if boundary_level in self.config.boundary_types:
-                        # Check a small window at the end of the text buffer
-                        search_window = self.current_chunk_text[-10:]  # Adjust window size if needed
-                        for boundary_type in self.config.boundary_types[boundary_level]:
-                            pattern = BOUNDARY_PATTERNS.get(boundary_type)
+                        search_window = self.current_chunk_text[-10:]
+                        for boundary_type_key in self.config.boundary_types[
+                            boundary_level]:  # renamed boundary_type to boundary_type_key
+                            pattern = BOUNDARY_PATTERNS.get(boundary_type_key)
                             if pattern and re.search(pattern, search_window):
                                 update_persist = True
-                                break  # Found a boundary
+                                break
                 except Exception as e:
                     print0(f"Warning: Error during semantic boundary check: {e}", self.config.logfile)
 
-            # Trigger the update if needed
             if update_persist:
-                print0("Triggering periodic persistent reverse update during generation.", self.config.logfile)
-                # Combine history + current buffer content (which includes tokens up to the one just generated)
-                # Note: self.current_chunk_tokens was updated inside the forward call at the start of this loop iteration.
+                if self.config.DEBUG_LEVEL > 0: print0(
+                    "Triggering periodic persistent reverse update during generation.", self.config.logfile)
+                # self.current_chunk_tokens already includes the 'next_id' due to the self.forward call
                 full_chunks_for_persist = self.closed_chunks + (
                     [self.current_chunk_tokens] if self.current_chunk_tokens else [])
-                if full_chunks_for_persist:  # Only run if there's history or current buffer content
-                    self._run_persistent_reverse_pass(full_chunks_for_persist, B=1, dev=dev)
+                if full_chunks_for_persist:
+                    # Determine logical length for this specific persistent reverse pass
+                    _logical_len_for_persist_pass = sum(len(c) for c in full_chunks_for_persist)
+                    if self.config.DEBUG_LEVEL > 0: print0(
+                        f"DEBUG Generate: Logical seq_len for persist pass: {_logical_len_for_persist_pass}",
+                        self.config.logfile)
+                    self._run_persistent_reverse_pass(full_chunks_for_persist, B=1, dev=dev,
+                                                      total_logical_sequence_length=_logical_len_for_persist_pass)
                 else:
-                    print0("Skipping periodic update: No history or current chunks available.", self.config.logfile)
-                self.tokens_since_persistent_update = 0  # Reset counter
+                    if self.config.DEBUG_LEVEL > 0: print0(
+                        "Skipping periodic update: No history or current chunks available.", self.config.logfile)
+                self.tokens_since_persistent_update = 0
 
-            # Prepare the input for the *next* iteration's forward call
-            current_token_input = [next_id]
+            current_token_input = [next_id]  # Prepare for the next iteration's forward call
 
-        # --- After the loop ---
-        # If the loop completed normally (didn't break early due to stop token or empty logits),
-        # we need to process the *last* generated token (held in current_token_input)
-        # to ensure the internal state (self.current_chunk_tokens) is fully up-to-date.
-        if current_token_input is not None:
-            if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: Processing final generated token {current_token_input} to update state.", self.config.logfile)
-            # This call updates self.current_chunk_tokens with the last token
+        # After the loop, if current_token_input is not None, it means the loop ended due to max_new_tokens
+        # and the last generated token (in current_token_input) hasn't been fully processed to update state.
+        if current_token_input is not None:  # True if loop finished by max_new_tokens, not by stop_token
+            if self.config.DEBUG_LEVEL > 0: print0(
+                f"DEBUG: Processing final generated token {current_token_input} to update state.",
+                self.config.logfile)
+            # This call updates self.current_chunk_tokens with the last token and ensures logical length is set
             _ = self.forward(current_token_input, training_mode=False)
-            if self.config.DEBUG_LEVEL > 0: print0(f"DEBUG: After final forward, current_chunk_tokens len: {len(self.current_chunk_tokens)}", self.config.logfile)
+            if self.config.DEBUG_LEVEL > 0: print0(
+                f"DEBUG: After final forward, current_chunk_tokens len: {len(self.current_chunk_tokens)}",
+                self.config.logfile)
         else:
-            if self.config.DEBUG_LEVEL > 0: print0("DEBUG: No final token processing needed (loop didn't complete fully or stop token hit).", self.config.logfile)
+            if self.config.DEBUG_LEVEL > 0: print0(
+                "DEBUG: No final token processing needed (loop broke early or stop token hit).",
+                self.config.logfile)
 
         return generated
 
@@ -1669,7 +1817,6 @@ class CMAModel(nn.Module):
         self.M_rev_ahead = {}
         self.M_rev_persist = {}
         # Re-initialize from learned parameters on next use by calling _initialize_memory_states
-        # Or force re-initialization here? Let's rely on _initialize_memory_states in forward/generate.
 
     def set_training_step(self, step: int, total_steps: int):
         """Set current training step for mask-future scheduling"""
