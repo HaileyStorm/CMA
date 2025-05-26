@@ -487,7 +487,7 @@ class Hyperparameters:
     base_seq_len = 512  # Base sequence length
     seq_init_mult = 8.0  # Initial sequence length multiplier
     seq_final_mult = 20.0  # Final sequence length multiplier
-    seq_ramp_frac = 0.5  # Fraction of total steps to reach final multiplier
+    seq_ramp_frac = 0.667 #0.5  # Fraction of total steps to reach final multiplier
     seq_short_prob = 0.5  # Probability of using shorter sequence
     seq_var_factor = 0.1  # Max reduction factor for shorter sequences
     # TODO: When current sequence mult < seq_final_mult, multiply batch size by min(1, seq_final_mult // current mul)
