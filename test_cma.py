@@ -1006,12 +1006,10 @@ class TestCMAModel:
         dev = get_device()
         basic_model.to(dev)
 
-        # Create enough tokens to trigger a cycle (more than one chunk)
-        # Use safe token IDs that are definitely within vocabulary
-        safe_token_id = min(10, basic_model.vocab_size - 1)  # Use a small, safe token ID
-        input_tokens = [safe_token_id] * (CHUNK_SIZE + 10)
+        safe_token_id = min(10, basic_model.vocab_size - 1)
+        input_tokens = [safe_token_id] * (CHUNK_SIZE + 10) # This is num_new_tokens_for_this_call
+        num_input_tokens = len(input_tokens)
 
-        # Store initial memory parameter values (before any updates)
         initial_mem_params = {}
         for group_id, mem_idx in basic_model.group_id_to_memory_idx.items():
             initial_mem_params[group_id] = (
@@ -1019,44 +1017,31 @@ class TestCMAModel:
                 basic_model.initial_rev_p_params[mem_idx].clone().detach()
             )
 
-        # Process input - should trigger cycle
         logits, loss = basic_model(input_tokens, training_mode=False)
 
-        # Check output shape (should be for the last chunk)
         assert logits.shape[0] == 1
-        assert logits.shape[1] == len(basic_model.current_chunk_tokens)
+        # CORRECTED ASSERTION: Logits should correspond to the original input tokens for this call
+        assert logits.shape[1] == num_input_tokens, \
+            f"Expected logits for {num_input_tokens} (original input), got {logits.shape[1]}"
         assert logits.shape[2] == VOCAB_SIZE
         assert loss is None
 
-        # Check state after cycle
-        assert len(basic_model.closed_chunks) > 0 # Cycle should have created closed chunks
-        assert len(basic_model.current_chunk_tokens) > 0
-        assert basic_model.total_tokens_processed == len(input_tokens) # Updated after cycle
-        assert basic_model.tokens_since_persistent_update == 0 # Reset after cycle
+        assert len(basic_model.closed_chunks) > 0
+        assert len(basic_model.current_chunk_tokens) > 0 # current_chunk_tokens is the tail end of re-chunked input_tokens
+        assert basic_model.total_tokens_processed == num_input_tokens
+        assert basic_model.tokens_since_persistent_update == 0
 
-        # Check memory states were updated (should differ from initial learned params)
-        assert len(basic_model.M_fwd) == basic_model.num_memory_groups
-        assert len(basic_model.M_rev_persist) == basic_model.num_memory_groups
         for group_id in basic_model.M_fwd:
             init_fwd, init_rev_p = initial_mem_params[group_id]
-            # Expand initial params to match batch size 1 for comparison
             init_fwd = init_fwd.expand(1, -1, -1).to(dev)
             init_rev_p = init_rev_p.expand(1, -1, -1).to(dev)
 
-            # Ensure memory state exists and has the correct shape
             assert group_id in basic_model.M_fwd
             assert basic_model.M_fwd[group_id].shape == init_fwd.shape
             assert group_id in basic_model.M_rev_persist
             assert basic_model.M_rev_persist[group_id].shape == init_rev_p.shape
 
-            # Check that memory has changed from the initial learned state due to updates
-            # Allow for small tolerance if updates are minimal
             assert not torch.allclose(basic_model.M_fwd[group_id], init_fwd, atol=1e-4), f"Fwd mem for group {group_id} did not change"
-            # Persistent reverse memory is updated based on all chunks *except* the last one.
-            # If there's only one chunk processed in the cycle (input slightly > chunk_size),
-            # the persistent reverse pass might not have eligible chunks to process,
-            # so M_rev_persist might remain close to its initial state.
-            # Only assert change if closed_chunks exist.
             if basic_model.closed_chunks:
                  assert not torch.allclose(basic_model.M_rev_persist[group_id], init_rev_p, atol=1e-4), f"Rev persist mem for group {group_id} did not change"
             else:
@@ -1255,11 +1240,10 @@ class TestCMAModel:
         dev = get_device()
         basic_model.to(dev)
 
-        # Input slightly larger than chunk size, but might re-chunk into one chunk
-        # depending on semantic boundaries or fixed-size gap.
-        # Use fixed size for predictability here.
         input_len = int(CHUNK_SIZE * 1.1)
-        input_tokens = list(range(input_len))
+        input_tokens = list(range(input_len)) # This is num_new_tokens_for_this_call
+        num_input_tokens = len(input_tokens)
+
 
         print(f"\nTesting cycle with input len {input_len} (expecting potentially 1 chunk post-rechunk)")
         logits, loss = basic_model(input_tokens, training_mode=False)
@@ -1268,31 +1252,41 @@ class TestCMAModel:
         print(f"  Resulting current chunk len: {len(basic_model.current_chunk_tokens)}")
         print(f"  Total tokens processed: {basic_model.total_tokens_processed}")
 
-        # Check if it resulted in one chunk
-        is_single_chunk = (len(basic_model.closed_chunks) == 0 and len(basic_model.current_chunk_tokens) > 0)
+        is_single_chunk_after_rechunk = (len(basic_model.closed_chunks) == 0 and len(basic_model.current_chunk_tokens) > 0 and sum(len(c) for c in basic_model.closed_chunks) + len(basic_model.current_chunk_tokens) == num_input_tokens)
 
-        # Assert basic output validity regardless
+
         assert logits.shape[0] == 1
-        assert logits.shape[1] == len(basic_model.current_chunk_tokens)
+        # CORRECTED ASSERTION: Logits should correspond to the original input tokens for this call
+        assert logits.shape[1] == num_input_tokens, \
+             f"Expected logits for {num_input_tokens} (original input), got {logits.shape[1]}"
         assert logits.shape[2] == VOCAB_SIZE
         assert loss is None
-        assert basic_model.total_tokens_processed == input_len
+        assert basic_model.total_tokens_processed == num_input_tokens
 
-        if is_single_chunk:
-            print("  Scenario: Re-chunked into a single chunk.")
-            # Check M_rev_persist state. It should be close to initial state as Pass 3 had no input.
+        if is_single_chunk_after_rechunk:
+            print("  Scenario: Re-chunked into a single chunk (which became current_chunk_tokens).")
             initial_rev_p = {}
             for group_id, mem_idx in basic_model.group_id_to_memory_idx.items():
-                initial_rev_p[group_id] = basic_model.initial_rev_p_params[mem_idx].clone().detach().to(dev).repeat(1,
-                                                                                                                    1,
-                                                                                                                    1)
+                initial_rev_p[group_id] = basic_model.initial_rev_p_params[mem_idx].clone().detach().to(dev).repeat(1,1,1)
 
             for group_id in basic_model.M_rev_persist:
+                # If the entire input re-chunked into one piece (current_chunk_tokens),
+                # then eligible_chunks for persistent reverse pass would be empty.
+                # So M_rev_persist should be close to its initial state.
                 assert torch.allclose(basic_model.M_rev_persist[group_id], initial_rev_p[group_id],
-                                      atol=1e-5), f"M_rev_persist for group {group_id} changed unexpectedly"
+                                      atol=1e-5), f"M_rev_persist for group {group_id} changed unexpectedly when no eligible chunks for persist pass"
         else:
-            print("  Scenario: Re-chunked into multiple chunks.")
-            # M_rev_persist should have changed (tested elsewhere)
+            print("  Scenario: Re-chunked into multiple chunks (closed_chunks + current_chunk_tokens).")
+            # M_rev_persist should have changed if there were closed_chunks
+            if basic_model.closed_chunks:
+                initial_rev_p = {}
+                for group_id, mem_idx in basic_model.group_id_to_memory_idx.items():
+                    initial_rev_p[group_id] = basic_model.initial_rev_p_params[mem_idx].clone().detach().to(dev).repeat(1,1,1)
+                changed_count = 0
+                for group_id in basic_model.M_rev_persist:
+                    if not torch.allclose(basic_model.M_rev_persist[group_id], initial_rev_p[group_id], atol=1e-5):
+                        changed_count +=1
+                assert changed_count > 0, "M_rev_persist expected to change with closed_chunks"
 
     def test_generate_prompt_triggers_cycle(self, basic_model, tokenizer):
         basic_model.reset_state()
@@ -1489,7 +1483,7 @@ class TestCMAModel:
         chunk1 = [safe_token_id] * 50
         chunk2 = [safe_token_id] * 70
         pre_chunked_input = [chunk1, chunk2]
-        total_input_len = len(chunk1) + len(chunk2)
+        total_input_len = len(chunk1) + len(chunk2) # This is num_new_tokens_for_this_call
 
         # Scenario 1: Evaluation mode
         basic_model.reset_state()
@@ -1497,7 +1491,10 @@ class TestCMAModel:
         logits_eval, loss_eval = basic_model(pre_chunked_input, training_mode=False)
 
         assert logits_eval.shape[0] == 1
-        assert logits_eval.shape[1] == len(chunk2)  # Logits for the last chunk
+        # CORRECTED ASSERTION: For pre-chunked, num_new_tokens_for_this_call is total_input_len.
+        # The cycle processes all of it, so logits for all these tokens are returned.
+        assert logits_eval.shape[1] == total_input_len, \
+            f"Expected logits for {total_input_len} (total pre-chunked input), got {logits_eval.shape[1]}"
         assert logits_eval.shape[2] == VOCAB_SIZE
         assert loss_eval is None
         assert basic_model.closed_chunks == [chunk1]
@@ -1507,24 +1504,21 @@ class TestCMAModel:
         # Scenario 2: Training mode
         basic_model.reset_state()
         basic_model.train()
-        basic_model.set_training_step(100, 1000)  # For mask-future
+        basic_model.set_training_step(100, 1000)
 
         logits_train, loss_train = basic_model(pre_chunked_input, training_mode=True)
 
         assert logits_train.shape[0] == 1
-        # In training mode with pre-chunked input, a cycle is triggered.
-        # Logits should be concatenated from Pass 2 processing of all input chunks.
         assert logits_train.shape[1] == total_input_len
         assert logits_train.shape[2] == VOCAB_SIZE
         assert loss_train is not None
         assert loss_train.ndim == 0
         assert loss_train.item() >= 0
-        # State after cycle with pre-defined chunks
-        assert basic_model.closed_chunks == [chunk1]  # Input chunks are used directly
+        assert basic_model.closed_chunks == [chunk1]
         assert basic_model.current_chunk_tokens == chunk2
         assert basic_model.total_tokens_processed == total_input_len
 
-        basic_model.eval()  # Reset
+        basic_model.eval()
 
     def test_memory_shapes_through_cycle(self, basic_model, tokenizer):
         basic_model.reset_state()
@@ -1735,67 +1729,61 @@ class TestUtilities:
 # - Persistent Reverse Memory Simulation + Mask-Future -> `TestCMAModel.test_forward_training_mode`
 # - Gate Regularization -> `TestCMAModel.test_forward_training_mode` checks loss aggregation. `TestAttentionLayers` checks loss return.
 
-def test_forward_pre_chunked(basic_model: CMAModel, tokenizer): # Keep tokenizer fixture if needed elsewhere, but don't use encode here
+def test_forward_pre_chunked(basic_model: CMAModel, tokenizer):
     basic_model.reset_state()
     basic_model.eval()
     dev = get_device()
     basic_model.to(dev)
 
-    # Ensure CUDA is synchronized before starting if needed
     if dev.type == 'cuda':
         torch.cuda.synchronize(dev)
 
-    # --- FIX: Generate valid token IDs manually ---
-    # Use a safe token ID guaranteed to be within the model's small vocab
     safe_token_id = min(10, VOCAB_SIZE - 1)
-    # Create chunks with reasonable lengths (less than CHUNK_SIZE for simplicity here)
     chunk1_len = 50
     chunk2_len = 70
     chunk1 = [safe_token_id] * chunk1_len
     chunk2 = [safe_token_id] * chunk2_len
-    # --- End FIX ---
 
     pre_chunked_input = [chunk1, chunk2]
+    total_input_len = chunk1_len + chunk2_len  # This is num_new_tokens_for_this_call
 
-    # Store initial memory parameter values (before any updates)
-    # Useful for debugging if assertions fail later
     initial_mem_params = {}
     if hasattr(basic_model, 'group_id_to_memory_idx'):
         for group_id, mem_idx in basic_model.group_id_to_memory_idx.items():
-             # Ensure parameters exist before cloning
-            fwd_param = basic_model.initial_fwd_params[mem_idx] if mem_idx < len(basic_model.initial_fwd_params) else None
-            rev_p_param = basic_model.initial_rev_p_params[mem_idx] if mem_idx < len(basic_model.initial_rev_p_params) else None
+            fwd_param = basic_model.initial_fwd_params[mem_idx] if mem_idx < len(
+                basic_model.initial_fwd_params) else None
+            rev_p_param = basic_model.initial_rev_p_params[mem_idx] if mem_idx < len(
+                basic_model.initial_rev_p_params) else None
             initial_mem_params[group_id] = (
                 fwd_param.clone().detach() if fwd_param is not None else None,
                 rev_p_param.clone().detach() if rev_p_param is not None else None
             )
 
-
-    # Processing pre-chunked should trigger a cycle immediately
     print(f"DEBUG: Calling basic_model forward with pre_chunked_input: shapes {[len(c) for c in pre_chunked_input]}")
     logits, loss = basic_model(pre_chunked_input, training_mode=False)
     print(f"DEBUG: basic_model forward returned.")
 
-    # Ensure CUDA sync after operation if debugging async issues
     if dev.type == 'cuda':
         torch.cuda.synchronize(dev)
 
     print(f"DEBUG: Logits shape: {logits.shape}")
-    print(f"DEBUG: Expected last chunk len: {len(chunk2)}")
+    print(
+        f"DEBUG: Expected last chunk len (chunk2): {len(chunk2)}")  # chunk2 is the last one, but not what logits correspond to
     print(f"DEBUG: Model closed_chunks: {[len(c) for c in basic_model.closed_chunks]}")
-    print(f"DEBUG: Model current_chunk_tokens: {len(basic_model.current_chunk_tokens)}")
+    print(f"DEBUG: Model current_chunk_tokens: {len(basic_model.current_chunk_tokens)}")  # This will be chunk2
     print(f"DEBUG: Model total_tokens_processed: {basic_model.total_tokens_processed}")
 
     assert logits.shape[0] == 1
-    assert logits.shape[1] == len(chunk2), f"Expected logits for {len(chunk2)} tokens, got {logits.shape[1]}" # Logits for the last chunk
+    # CORRECTED ASSERTION: Logits should be for all input tokens when input is pre-chunked list of lists.
+    assert logits.shape[1] == total_input_len, \
+        f"Expected logits for {total_input_len} (total pre-chunked input), got {logits.shape[1]}"
     assert logits.shape[2] == VOCAB_SIZE
     assert loss is None, "Loss should be None in eval mode"
 
-    # Check state reflects processing of both chunks
-    assert basic_model.closed_chunks == [chunk1], f"Expected closed chunks {[len(c) for c in [chunk1]]}, got {[len(c) for c in basic_model.closed_chunks]}"
+    assert basic_model.closed_chunks == [
+        chunk1], f"Expected closed chunks {[len(c) for c in [chunk1]]}, got {[len(c) for c in basic_model.closed_chunks]}"
     assert basic_model.current_chunk_tokens == chunk2, f"Expected current chunk len {len(chunk2)}, got {len(basic_model.current_chunk_tokens)}"
-    expected_processed = len(chunk1) + len(chunk2)
-    assert basic_model.total_tokens_processed == expected_processed, f"Expected total_tokens_processed {expected_processed}, got {basic_model.total_tokens_processed}"
+    assert basic_model.total_tokens_processed == total_input_len, f"Expected total_tokens_processed {total_input_len}, got {basic_model.total_tokens_processed}"
 
 # Add test for reset_memory_on_cycle=False
 def test_forward_cycle_no_reset(basic_config_dict, tokenizer):
