@@ -2,6 +2,8 @@ from typing import Tuple, Optional, List, Dict
 import re
 import tiktoken
 import torch.nn as nn
+from triton.language import bfloat16
+
 from cma_components import *
 
 
@@ -147,7 +149,7 @@ class CascadeMemoryAttention(nn.Module):
                 control_tokens["memory_usage_ratio"],
                 control_tokens["memory_density_ratio"],
                 control_tokens["chunk_position_ratio"]
-            ], device=x.device).unsqueeze(0).unsqueeze(0).expand(B, T, -1)
+            ], device=x.device).unsqueeze(0).unsqueeze(0).expand(B, T, -1).to(x.dtype)
             q = q + self.control_proj(ctrl_vec)
 
         if T == 0:
@@ -213,8 +215,8 @@ class CascadeMemoryAttention(nn.Module):
 
         for memory in [forward_memory, reverse_memory]:
             if memory is not None:
-                memory_k_list.append(self.k_proj(memory))
-                memory_v_list.append(self.v_proj(memory))
+                memory_k_list.append(self.k_proj(memory.to(k.dtype)))
+                memory_v_list.append(self.v_proj(memory.to(k.dtype)))
 
         return torch.cat(memory_k_list, dim=1), torch.cat(memory_v_list, dim=1)
 
@@ -284,6 +286,7 @@ class CascadeMemoryAttention(nn.Module):
         gate_proj = getattr(self, f'{prefix}_gate_proj')
 
         # Compute attention update
+        memory_old = memory_old.to(chunk_tokens.dtype)
         memory_q = q_proj(memory_old).view(B, M, self.n_heads, self.head_dim).transpose(1, 2)
         chunk_k = k_proj(chunk_tokens).view(B, -1, self.n_heads, self.head_dim).transpose(1, 2)
         chunk_v = v_proj(chunk_tokens).view(B, -1, self.n_heads, self.head_dim).transpose(1, 2)
@@ -298,7 +301,7 @@ class CascadeMemoryAttention(nn.Module):
             delta = delta * decay_weights
 
         # Apply gated update
-        gate = torch.sigmoid(gate_proj(torch.cat([memory_old, delta], dim=-1)))
+        gate = torch.sigmoid(gate_proj(torch.cat([memory_old, delta], dim=-1).to(attn_weights.dtype)))
         memory_new = gate * memory_old + (1 - gate) * delta
 
         if write_mask is not None:
@@ -464,6 +467,7 @@ class CMAModel(nn.Module):
 
         # Initialize weights
         self.apply(self._init_weights)
+        #self.lm_head.weight.data.zero_()
         self._finalize_gate_bias_init()
         self._print_parameter_count()
 

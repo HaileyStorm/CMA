@@ -1150,9 +1150,11 @@ class TestCMAModel:
             torch.cuda.synchronize(dev)
 
         basic_model.forward = mocked_forward
-        generated_ids = basic_model.generate(prompt=prompt_tokens, max_new_tokens=max_gen, stop_token_id=stop_id,
-                                             reset_state=True)
-        basic_model.forward = original_forward  # Restore original method
+        try:
+            generated_ids = basic_model.generate(prompt=prompt_tokens, max_new_tokens=max_gen, stop_token_id=stop_id,
+                                                 reset_state=True)
+        finally:
+            basic_model.forward = original_forward  # Restore original method
 
         assert stop_id in generated_ids
         assert generated_ids[-1] == stop_id # Should end with stop token

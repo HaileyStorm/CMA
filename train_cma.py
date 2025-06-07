@@ -3,18 +3,13 @@ import os
 import random
 import sys
 from typing import Union
-
-with open(sys.argv[0]) as f:
-    code = f.read()  # read the code of this file ASAP, for logging
 import uuid
 import time
 import glob
 from dataclasses import dataclass
 from pathlib import Path
-
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
-
 torch.empty(1, device="cuda", requires_grad=True).backward()  # prevents a bug on some systems
 from torch import Tensor
 import torch.nn as nn
@@ -26,6 +21,46 @@ import torch._inductor.config as inductor_config
 # Import CMA model
 from cma_model import CMAModel, CascadeMemoryAttention, CanonConv, CausalSelfAttention
 from cma_components import CMAConfig
+
+
+def collect_source(*extra_files: str) -> str:
+    """
+    Concatenate the source of this script with any additional Python files.
+
+    Parameters
+    ----------
+    *extra_files
+        Filenames (relative to the directory of this script) that should be
+        appended in the order given.
+
+    Returns
+    -------
+    str
+        A single string containing each file’s code, delimited by a header
+        comment so it’s obvious where each file starts when you inspect logs.
+    """
+    base_dir = Path(__file__).resolve().parent
+    parts: list[str] = []
+
+    # first: the training script itself
+    with Path(__file__).open(encoding="utf-8") as fp:
+        parts.append(f"# === {Path(__file__).name} ===\n")
+        parts.append(fp.read())
+
+    # then: any extra modules you want to log
+    for name in extra_files:
+        path = base_dir / name
+        try:
+            with path.open(encoding="utf-8") as fp:
+                parts.append(f"\n# === {name} ===\n")
+                parts.append(fp.read())
+        except FileNotFoundError:
+            pass
+
+    return "".join(parts)
+
+
+code = collect_source("cma_model.py", "cma_components.py")
 
 
 # -----------------------------------------------------------------------------
@@ -44,7 +79,7 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     """
     assert G.ndim >= 2  # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
     a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G.bfloat16()
+    X = G.float()  # Faster and better results with float and the cast in the return instead of casting this to bf16 (in my tests at least...)
     if G.size(-2) > G.size(-1):
         X = X.mT
 
@@ -58,7 +93,7 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
 
     if G.size(-2) > G.size(-1):
         X = X.mT
-    return X
+    return X.to(G.dtype)
 
 
 class Muon(torch.optim.Optimizer):
@@ -378,8 +413,12 @@ class CMATrainingHelper:
         # The `inputs_token_ids` from data_handler is already List[int] effectively (from Tensor.tolist())
 
         # Logits from model.forward are now potentially concatenated from all Pass 2 chunks
-        # Gate_loss is also aggregated from all Pass 2 chunks
-        logits, gate_loss = self.model(inputs_token_ids, training_mode=True)
+        # Gate_loss is also aggregated from all Pass 2
+        if args.use_bf16:
+            with torch.autocast('cuda', dtype=torch.bfloat16, enabled=args.use_bf16):
+                logits, gate_loss = self.model(inputs_token_ids, training_mode=True)
+        else:
+            logits, gate_loss = self.model(inputs_token_ids, training_mode=True)
 
         pred_loss_normalized = torch.tensor(0.0, device=logits.device)  # Match logits device
 
@@ -444,7 +483,11 @@ class CMATrainingHelper:
         with torch.no_grad():
             # training_mode=False, gate_loss is ignored
             #print(inputs_token_ids)
-            logits, _gate_loss_ignored = self.model(inputs_token_ids, training_mode=False)
+            if args.use_bf16:
+                with torch.autocast('cuda', dtype=torch.bfloat16, enabled=args.use_bf16):
+                    logits, _gate_loss_ignored = self.model(inputs_token_ids, training_mode=False)
+            else:
+                logits, _gate_loss_ignored = self.model(inputs_token_ids, training_mode=False)
 
             if logits.numel() > 0 and logits.size(1) > 0:
                 num_predicted_tokens = logits.size(1)
@@ -459,7 +502,7 @@ class CMATrainingHelper:
                     num_predicted_tokens = logits.size(1)
 
                 if num_predicted_tokens > 0:
-                    print0(f"VALIDATION LOSS INPUT: logits shape {logits.view(-1, logits.size(-1)).shape}, targets shape {actual_targets_for_loss.view(-1).shape}")
+                    #print0(f"VALIDATION LOSS INPUT: logits shape {logits.view(-1, logits.size(-1)).shape}, targets shape {actual_targets_for_loss.view(-1).shape}")
                     pred_loss = F.cross_entropy(
                         logits.view(-1, logits.size(-1)),
                         actual_targets_for_loss.view(-1),
@@ -487,7 +530,7 @@ class Hyperparameters:
     base_seq_len = 512  # Base sequence length
     seq_init_mult = 8.0  # Initial sequence length multiplier
     seq_final_mult = 20.0  # Final sequence length multiplier
-    seq_ramp_frac = 0.667 #0.5  # Fraction of total steps to reach final multiplier
+    seq_ramp_frac = 0.667  # Fraction of total steps to reach final multiplier
     seq_short_prob = 0.5  # Probability of using shorter sequence
     seq_var_factor = 0.1  # Max reduction factor for shorter sequences
     # TODO: When current sequence mult < seq_final_mult, multiply batch size by min(1, seq_final_mult // current mul)
@@ -538,9 +581,9 @@ class Hyperparameters:
     num_iterations = 1770
     cooldown_frac = 0.4
     gradient_accumulation_steps = 8  # Accumulate gradients over multiple sequences before update
-    # learning rates
+    # learning rates - these will be scaled by 0.707 (sqrt of precision ratio) if bf16 is enabled
     lr_adam_lm_head = 0.0035
-    lr_adam_embed = 0.5
+    lr_adam_embed = 0.212  #0.5
     lr_adam_init_fwd = 0.0035
     lr_adam_init_rev_la = 0.0035
     lr_adam_init_rev_p = 0.0035
@@ -553,6 +596,9 @@ class Hyperparameters:
     adam_beta1 = 0.8
     adam_beta2 = 0.95
     muon_momentum = 0.95
+    # Other
+    grad_clip = 1.0
+    use_bf16 = True
 
     # evaluation and logging
     val_loss_every = 25  #125
@@ -562,6 +608,19 @@ class Hyperparameters:
 args = Hyperparameters()
 
 assert args.base_seq_len * args.seq_init_mult >= args.chunk_size_min
+
+# Scale learning rates by 0.707 (sqrt of precision ratio) if bf16 is enabled
+if args.use_bf16:
+    args.lr_adam_lm_head *= 0.797
+    args.lr_adam_embed *= 0.797
+    args.lr_adam_init_fwd *= 0.797
+    args.lr_adam_init_rev_la *= 0.797
+    args.lr_adam_init_rev_p *= 0.797
+    args.lr_adam_control_proj *= 0.797
+    args.lr_adam_attn_gates *= 0.797
+    args.lr_adam_update_gates *= 0.797
+    args.lr_adam_other *= 0.797
+    args.lr_muon *= 0.797
 
 # Setup distributed training
 try:
@@ -601,7 +660,7 @@ def print0(s, console=False):
 
 
 # Log initial information
-#print0(code)
+print0(code)
 print0("=" * 100)
 print0(f"Running Python {sys.version}")
 print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
@@ -635,6 +694,8 @@ config = CMAConfig(
 
 # Create model
 model_without_ddp = CMAModel(config, args.vocab_size).cuda() # Create the base model
+if args.use_bf16:
+    model_without_ddp = model_without_ddp.bfloat16()
 total_params = sum(p.numel() for p in model_without_ddp.parameters())
 print0(f"Model created with {total_params:,} parameters", console=True)
 
@@ -858,7 +919,7 @@ else:
     #print0("Parameter coverage check: OKAY", console=True)
     pass
 
-optimizer1 = torch.optim.Adam(adam_param_groups_filtered, betas=(args.adam_beta1, args.adam_beta2), eps=1e-10, fused=True)
+optimizer1 = torch.optim.Adam(adam_param_groups_filtered, betas=(args.adam_beta1, args.adam_beta2), eps=1e-9, fused=True)
 optimizer2 = Muon(final_muon_params, lr=args.lr_muon, momentum=args.muon_momentum, rank=rank, world_size=world_size)
 optimizers = [optimizer1, optimizer2]
 
@@ -1187,6 +1248,7 @@ for step in range(train_steps + 1):
 
     # Step optimizers
     for opt in optimizers:
+        grad_norm = torch.nn.utils.clip_grad_norm_(opt.param_groups[0]['params'], args.grad_clip)  # TODO: log grad_norm
         opt.step()
 
     # Logging
