@@ -6,7 +6,7 @@ from typing import Union
 import uuid
 import time
 import glob
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from pathlib import Path
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -17,6 +17,8 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch._inductor.config as inductor_config
+import itertools
+import copy
 
 # Import CMA model
 from cma_model import CMAModel, CascadeMemoryAttention, CanonConv, CausalSelfAttention
@@ -514,17 +516,28 @@ class CMATrainingHelper:
         return val_loss_value
 
 
+def clip_grad_all_groups(optimizer, max_norm):
+    # flatten out every 'params' list in every param_group
+    all_params = list(itertools.chain.from_iterable(
+        group['params'] for group in optimizer.param_groups
+    ))
+    # clip and return the *global* norm over all those params
+    global_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm)
+    return global_norm
+
+
 # -----------------------------------------------------------------------------
 # Main training script
 
 @dataclass
 class Hyperparameters:
     DEBUG_LEVEL = 0 # 0=warnings/errors/etc. only, 1=debug, 2=info
+    log_wandb = True
 
     # data
     train_files = "data/fineweb10B/fineweb_train_*.bin"
     val_files = "data/fineweb10B/fineweb_val_*.bin"
-    val_tokens = 819200 #10485760
+    val_tokens = 4044800  #819200 #10485760
 
     # Sequence length curriculum parameters
     base_seq_len = 512  # Base sequence length
@@ -597,11 +610,11 @@ class Hyperparameters:
     adam_beta2 = 0.95
     muon_momentum = 0.95
     # Other
-    grad_clip = 1.0
+    grad_clip = 0.5  #1.0
     use_bf16 = True
 
     # evaluation and logging
-    val_loss_every = 25  #125
+    val_loss_every = 500 #25  #125
     save_checkpoint = False
 
 
@@ -643,6 +656,10 @@ dist.barrier()
 master_process = (rank == 0)
 
 # Logging setup
+if master_process and args.log_wandb:
+    import wandb
+    wandb.init(project="CMA", config=asdict(args))
+
 logfile = None
 if master_process:
     run_id = uuid.uuid4()
@@ -689,6 +706,7 @@ config = CMAConfig(
     mask_future_rates=args.mask_future_rates,
     layer_structure=args.layer_structure,
     DEBUG_LEVEL=args.DEBUG_LEVEL,
+    log_wandb=args.log_wandb,
     logfile=logfile
 )
 
@@ -963,32 +981,74 @@ except:
     print0("Warning: torch.compile not available, running uncompiled model", console=True)
 
 train_loader = data_handler.get_training_data_generator()
-"""
-print0(f"Warming up model for 5 steps", console=True)
+
+########################################
+#            Warmup kernels            #
+########################################
+
+print0("Starting kernel warmup...", console=True)
+# Warmup the training kernels, then re-initialize the state so we aren't cheating
+warmup_steps = 10
+initial_state = dict(
+    model=copy.deepcopy((model.module if ddp_active else model).state_dict()),
+    optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]
+)  # save the initial state
+log_wandb = args.log_wandb
+args.log_wandb = False
+(model.module if ddp_active else model).config.log_wandb = False
+
 model.train()
-for step in range(5):
-    current_chunk_size = get_chunk_size(step)
-    data_handler.set_chunk_size(current_chunk_size)
+for warmup_step in range(warmup_steps):
+    # Get a warmup chunk size (use minimum to ensure fast warmup)
+    warmup_chunk_size = args.chunk_size_min
+    data_handler.set_chunk_size(warmup_chunk_size)
     current_model_instance = model.module if ddp_active else model
-    current_model_instance.config.chunk_size = current_chunk_size
-    current_model_instance.chunk_processor.config.chunk_size = current_chunk_size
+    current_model_instance.config.chunk_size = warmup_chunk_size
+    current_model_instance.chunk_processor.config.chunk_size = warmup_chunk_size
+
     model.zero_grad(set_to_none=True)
+
+    # Run through gradient accumulation steps like in real training
     for accum_step in range(args.gradient_accumulation_steps):
         model.reset_state()
         raw_inputs_tensor, raw_targets_tensor = next(train_loader)
         inputs_for_model_list = raw_inputs_tensor.cpu().tolist()
         targets_for_loss_calc_list = raw_targets_tensor.cpu().tolist()
-        _, _ = training_helper.train_step(
+
+        total_loss_tensor, _ = training_helper.train_step(
             inputs_for_model_list,
-            targets_for_loss_calc_list,  # Pass the corresponding targets
-            step,
-            args.num_iterations  # Corrected from total_steps to train_steps for consistency
+            targets_for_loss_calc_list,
+            warmup_step,
+            args.num_iterations
         )
-    print(".", end='', flush=True)
-    print0(f"########## WARMUP STEP {step} of 5 COMPLETE ##########")
-print0("\nWarmup complete.", console=True)
+
+        scaled_loss_for_backward = total_loss_tensor / args.gradient_accumulation_steps
+        scaled_loss_for_backward.backward()
+
+    # Gradient reduction (same as real training)
+    if not ddp_active and world_size > 1:
+        for param in model.parameters():
+            if param.grad is not None:
+                dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+
+    # Step optimizers
+    for opt in optimizers:
+        opt.step()
+
+    print0(f"Warmup step {warmup_step + 1}/{warmup_steps} complete", console=True)
+
+# Restore initial state
+print0("Restoring initial state after warmup...", console=True)
+(model.module if ddp_active else model).load_state_dict(initial_state["model"])
+for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
+    opt.load_state_dict(opt_state)
+args.log_wandb = log_wandb
+(model.module if ddp_active else model).config.log_wandb = log_wandb
+del initial_state, log_wandb
+
+# Create fresh data loader for actual training
 train_loader = data_handler.get_training_data_generator()
-"""
+print0("Warmup complete, starting actual training.", console=True)
 
 # Training loop
 training_time_ms = 0
@@ -1016,12 +1076,12 @@ for step in range(train_steps + 1):
         training_time_ms += 1000 * (time.perf_counter() - t0)
 
         # Calculate current sequence length for validation based on training curriculum
-        # Ensure seq_final_mult - seq_init_mult is not zero for division
         seq_mult_diff = args.seq_final_mult - args.seq_init_mult
-        ramp_denominator_inv_steps = ((args.seq_ramp_frac * args.num_iterations) / max(1.0, seq_mult_diff)) * args.gradient_accumulation_steps
+        ramp_denominator_inv_steps = ((args.seq_ramp_frac * args.num_iterations) / max(1.0,
+                                                                                       seq_mult_diff)) * args.gradient_accumulation_steps
 
         current_mult_val = args.seq_init_mult
-        if ramp_denominator_inv_steps > 0:  # Avoid division by zero if ramp_steps or grad_accum_steps is 0
+        if ramp_denominator_inv_steps > 0:
             progression = step / ramp_denominator_inv_steps
             current_mult_val = min(
                 args.seq_final_mult,
@@ -1030,53 +1090,53 @@ for step in range(train_steps + 1):
         current_mult_val = max(1.0, current_mult_val)
 
         current_eval_seq_len = int(round(args.base_seq_len * current_mult_val))
-        # Ensure it's at least a minimum practical length, e.g., smallest chunk size or base_seq_len
         current_eval_seq_len = max(current_eval_seq_len, args.base_seq_len, args.chunk_size_min)
 
-        print0(f"Running validation with sequence length: {current_eval_seq_len} (val_tokens budget: {args.val_tokens})",
-               console=True)
+        print0(
+            f"Running validation with sequence length: {current_eval_seq_len} (val_tokens budget: {args.val_tokens})",
+            console=True)
         model.eval()
-        # Pass the calculated sequence length to the validation data generator
         val_loader = data_handler.get_validation_data_generator(current_eval_seq_len)
         val_loss = 0
-        val_count = 0  # Counts number of validation batches processed
+        val_count = 0
 
         with torch.no_grad():
-            for val_batch_idx, (inputs, targets) in enumerate(val_loader):  # val_batch_idx for debug print
-                if inputs.numel() == 0 or targets.numel() == 0:  # Skip if a rank got an empty batch
-                    # print0(f"Rank {rank} got empty val batch {val_batch_idx}, skipping", console=True) # Debug
+            for val_batch_idx, (inputs, targets) in enumerate(val_loader):
+                if inputs.numel() == 0 or targets.numel() == 0:
                     continue
-                model.reset_state()  # Reset state for each validation sequence
+                model.reset_state()
                 inputs_list = inputs.cpu().tolist()
                 targets_list = targets.cpu().tolist()
-                if model.config.DEBUG_LEVEL > 0:
-                    print0(f"DEBUG VAL PRE-FORWARD: ValIter {val_batch_idx}, "
-                                f"TotalTokensProcessed: {model.total_tokens_processed}, "
-                                f"NumClosedChunks: {len(model.closed_chunks)}, "
-                                f"M_fwd keys: {list(model.M_fwd.keys()) if model.M_fwd else 'None'}")
                 loss = training_helper.val_step(inputs_list, targets_list, step, train_steps)
                 val_loss += loss
                 val_count += 1
-                #print(".", end='', flush=True)  # Progress per batch
-                # Removed "of {val_steps}" as total steps is now dynamic
-                # print0(f"########## VALIDATION BATCH {val_count} COMPLETE (SeqLen: {inputs.size(1) if inputs.ndim > 1 else 0}) ##########")
 
         if val_count > 0:
             val_loss /= val_count
         else:
-            val_loss = 0.0  # Or some other indicator if no validation batches were run
+            val_loss = 0.0
 
         # Properly handle distributed validation loss
         val_loss_tensor = torch.tensor(val_loss, device=device)
-        # Synchronize before all_reduce if operations were async or on different streams, though val_step is sync.
-        if world_size > 1:  # only reduce if multiple processes
+        if world_size > 1:
             dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.AVG)
         val_loss = val_loss_tensor.item()
 
-        #print0("\nValidation complete.", console=True)
+        timed_steps = max(step, 1) - 10 if 10 <= step < 14 else max(step, 1)
         print0(
-            f"step:{step}/{train_steps} val_loss:{val_loss:.4f} chunk_size:{current_chunk_size} val_seq_len_curriculum:{current_eval_seq_len} val_batches_run:{val_count} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms",
+            f"step:{step}/{train_steps} val_loss:{val_loss:.4f} chunk_size:{current_chunk_size} val_seq_len_curriculum:{current_eval_seq_len} val_batches_run:{val_count} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / timed_steps:.2f}ms",
             console=True)
+
+        # Log validation metrics
+        if master_process and args.log_wandb:
+            wandb.log({
+                "val/loss": val_loss,
+                "val/sequence_length": current_eval_seq_len,
+                "val/batches_processed": val_count,
+                "curriculum/sequence_multiplier": current_mult_val,
+                "system/training_time_ms": training_time_ms,
+                "system/step_avg_ms": training_time_ms / max(step, 1),
+            }, step=step)
 
         model.train()
 
@@ -1087,65 +1147,46 @@ for step in range(train_steps + 1):
     if last_step:
         if master_process and args.save_checkpoint:
             save_model_state = model.module.state_dict() if ddp_active else model.state_dict()
-            log = dict(step=step, code=code, model=save_model_state,  # Save underlying model
+            log = dict(step=step, code=code, model=save_model_state,
                        config=underlying_model.config.to_dict() if hasattr(underlying_model.config,
                                                                            'to_dict') else vars(
-                           underlying_model.config),  # Save config
+                           underlying_model.config),
                        optimizers=[opt.state_dict() for opt in optimizers])
             os.makedirs(f"logs/{run_id}", exist_ok=True)
             torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
         break
 
-    # TODO: Why isn't the warmup enough (why are the first few real training steps slow, especially the first?)
-    if step == 5:
+    # --------------- TRAINING SECTION -----------------
+    if step == 10:
         training_time_ms = 0
         t0 = time.perf_counter()
-
-    # --------------- TRAINING SECTION -----------------
-    # Zero gradients once before accumulation
+    if step == 13:
+        training_time_ms += ((1000 * (time.perf_counter() - t0)) / 4.0) * 10
     model.zero_grad(set_to_none=True)
 
     accumulated_total_loss_for_logging = 0.0
     accumulated_pred_loss_for_logging = 0.0
 
     for accum_step in range(args.gradient_accumulation_steps):
-        # Reset model state at the start of each sequence
-        # DDP forwards this to the underlying module if the method exists there
         model.reset_state()
 
-        # Get next sequence (inputs and targets are full sequence tensors)
         data_handler.update_step(step)
         raw_inputs_tensor, raw_targets_tensor = next(train_loader)
-        if args.DEBUG_LEVEL > 0:
-            print0(f"DEBUG TRAIN PRE-FORWARD: Step {step}, MicroBatch {accum_step}, "
-                        f"TotalTokensProcessed: {model.total_tokens_processed}, "
-                        f"NumClosedChunks: {len(model.closed_chunks)}, "
-                        f"M_fwd keys: {list(model.M_fwd.keys()) if model.M_fwd else 'None'}")
 
-        # Convert to lists for CMATrainingHelper and CMAModel
-        # inputs_for_model is seq[:-1], targets_for_loss_calc is seq[1:]
-        # CMAModel.forward will use inputs_for_model.
-        # CMATrainingHelper.train_step will use targets_for_loss_calc to align with returned logits.
         inputs_for_model_list = raw_inputs_tensor.cpu().tolist()
         targets_for_loss_calc_list = raw_targets_tensor.cpu().tolist()
 
         total_loss_tensor, pred_loss_normalized_tensor = training_helper.train_step(
             inputs_for_model_list,
-            targets_for_loss_calc_list,  # Pass the corresponding targets
+            targets_for_loss_calc_list,
             step,
-            train_steps  # Corrected from total_steps to train_steps for consistency
+            train_steps
         )
 
-        # Accumulate for logging (using .item() for Python floats)
         accumulated_total_loss_for_logging += total_loss_tensor.item()
         accumulated_pred_loss_for_logging += pred_loss_normalized_tensor.item()
 
-        # Scale loss for gradient accumulation before backward pass
         scaled_loss_for_backward = total_loss_tensor / args.gradient_accumulation_steps
-
-        # Backward pass on the scaled loss tensor
-        # The DDP hook will handle allreduce during backward if model is DDP wrapped.
-        # If not DDP wrapped, manual allreduce is needed after accumulation.
         scaled_loss_for_backward.backward()
 
     # Average the accumulated losses for logging
@@ -1154,108 +1195,116 @@ for step in range(train_steps + 1):
 
     # Gradient reduction across all workers (ONLY if not using DDP's automatic gradient sync)
     if not ddp_active and world_size > 1:
-        for param in model.parameters():  # model.parameters() is fine here
+        for param in model.parameters():
             if param.grad is not None:
                 dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
 
-    # --- START GRADIENT NORM LOGGING (for step % log_every_n_steps == 0) ---
-    if master_process and (step + 1) % 10 == 0:  # Log every 10 steps, or adjust frequency
-        print0(f"--- Grad Norms for Step {step + 1} ---")
-        # Access the underlying model if DDP is active
+    # Collect gradient norms for logging
+    grad_norms = {}
+    if master_process and (step + 1) % 10 == 0:
         model_to_inspect = model.module if ddp_active else model
 
-        # 1. Initial Memory Parameters
+        # Initial memory parameter gradients
+        # initial_rev_la_params
         if hasattr(model_to_inspect, 'initial_fwd_params') and model_to_inspect.initial_fwd_params:
-            for i, param in enumerate(model_to_inspect.initial_fwd_params):
-                if param.grad is not None:
-                    print0(f"  initial_fwd_params[{i}]: {param.grad.norm().item():.4e}")
-                else:
-                    print0(f"  initial_fwd_params[{i}]: No Grad")
-        if hasattr(model_to_inspect,
-                   'initial_rev_la_params') and model_to_inspect.initial_rev_la_params:  # For completeness
-            for i, param in enumerate(model_to_inspect.initial_rev_la_params):
-                if param.grad is not None:
-                    print0(f"  initial_rev_la_params[{i}]: {param.grad.norm().item():.4e}")
-                else:
-                    print0(f"  initial_rev_la_params[{i}]: No Grad")
+            param = model_to_inspect.initial_fwd_params[0]
+            if param.grad is not None:
+                grad_norms[f"grad_norms/initial_fwd_memory"] = param.grad.norm().item()
+        if hasattr(model_to_inspect, 'initial_rev_la_params') and model_to_inspect.initial_rev_la_params:
+            param = model_to_inspect.initial_rev_la_params[0]
+            if param.grad is not None:
+                grad_norms[f"grad_norms/initial_rev_la_memory"] = param.grad.norm().item()
         if hasattr(model_to_inspect, 'initial_rev_p_params') and model_to_inspect.initial_rev_p_params:
-            for i, param in enumerate(model_to_inspect.initial_rev_p_params):
-                if param.grad is not None:
-                    print0(f"  initial_rev_p_params[{i}]: {param.grad.norm().item():.4e}")
-                else:
-                    print0(f"  initial_rev_p_params[{i}]: No Grad")
+            param = model_to_inspect.initial_rev_p_params[0]
+            if param.grad is not None:
+                grad_norms[f"grad_norms/initial_rev_p_memory"] = param.grad.norm().item()
 
-        # 2. CascadeMemoryAttention Layer Parameters (iterate through layers)
-        for layer_idx, block in enumerate(model_to_inspect.layers):
-            if hasattr(block, 'attn') and isinstance(block.attn, CascadeMemoryAttention):
-                # Attention Gating Proj
-                if block.attn.gate_proj.weight.grad is not None:
-                    print0(f"  Layer {layer_idx} AttnGate W: {block.attn.gate_proj.weight.grad.norm().item():.4e}")
-                if block.attn.gate_proj.bias.grad is not None:
-                    print0(f"  Layer {layer_idx} AttnGate B: {block.attn.gate_proj.bias.grad.norm().item():.4e}")
+        # Gate proj
+        for layer_idx in [0, len(model_to_inspect.layers) - 1]:
+            if layer_idx < len(model_to_inspect.layers):
+                block = model_to_inspect.layers[layer_idx]
+                if hasattr(block, 'attn') and isinstance(block.attn, CascadeMemoryAttention):
+                    if block.attn.gate_proj.weight.grad is not None:
+                        grad_norms[
+                            f"grad_norms/layer_{layer_idx}_gate_proj_w"] = block.attn.gate_proj.weight.grad.norm().item()
+                    if block.attn.gate_proj.bias.grad is not None:
+                        grad_norms[
+                            f"grad_norms/layer_{layer_idx}_gate_proj_b"] = block.attn.gate_proj.bias.grad.norm().item()
 
-                # Memory Update Components (if they exist on this layer instance)
-                if block.attn.is_memory_update:
-                    # Forward Memory Update Gate
-                    if hasattr(block.attn,
-                               'fwd_memory_gate_proj') and block.attn.fwd_memory_gate_proj.weight.grad is not None:
-                        print0(
-                            f"  Layer {layer_idx} FwdMemUpdGate W: {block.attn.fwd_memory_gate_proj.weight.grad.norm().item():.4e}")
-
-                    # Reverse Memory Update Gate
-                    if hasattr(block.attn,
-                               'rev_memory_gate_proj') and block.attn.rev_memory_gate_proj.weight.grad is not None:
-                        print0(
-                            f"  Layer {layer_idx} RevMemUpdGate W: {block.attn.rev_memory_gate_proj.weight.grad.norm().item():.4e}")
-
-                    # QKV for Forward Memory Update
-                    if hasattr(block.attn,
-                               'fwd_memory_q_proj') and block.attn.fwd_memory_q_proj.weight.grad is not None:
-                        print0(
-                            f"  Layer {layer_idx} FwdMemUpd_Q W: {block.attn.fwd_memory_q_proj.weight.grad.norm().item():.4e}")
-                    if hasattr(block.attn,
-                               'fwd_memory_k_proj') and block.attn.fwd_memory_k_proj.weight.grad is not None:
-                        print0(
-                            f"  Layer {layer_idx} FwdMemUpd_K W: {block.attn.fwd_memory_k_proj.weight.grad.norm().item():.4e}")
-                    if hasattr(block.attn,
-                               'fwd_memory_v_proj') and block.attn.fwd_memory_v_proj.weight.grad is not None:
-                        print0(
-                            f"  Layer {layer_idx} FwdMemUpd_V W: {block.attn.fwd_memory_v_proj.weight.grad.norm().item():.4e}")
-
-                    # QKV for Reverse Memory Update (shared)
-                    if hasattr(block.attn,
-                               'rev_memory_q_proj') and block.attn.rev_memory_q_proj.weight.grad is not None:
-                        print0(
-                            f"  Layer {layer_idx} RevMemUpd_Q W: {block.attn.rev_memory_q_proj.weight.grad.norm().item():.4e}")
-                    # ... K and V for reverse, if you want to be exhaustive, but Q is indicative
-
-            # You could also log norms for block.mlp if desired
-            # if block.mlp[0].weight.grad is not None: # First linear layer of MLP
-            #     print0(f"  Layer {layer_idx} MLP1 W: {block.mlp[0].weight.grad.norm().item():.4e}")
-
-        print0(f"--- End Grad Norms for Step {step + 1} ---")
-    # --- END GRADIENT NORM LOGGING ---
-
-    # Set learning rates
+    # Set learning rates and get current LR for logging
+    current_lr_multiplier = get_lr(step)
     for opt in optimizers:
         for group in opt.param_groups:
-            group["lr"] = group["initial_lr"] * get_lr(step)
+            group["lr"] = group["initial_lr"] * current_lr_multiplier
 
     # Momentum warmup for Muon
+    current_momentum = None
     for group in optimizer2.param_groups:
         frac = min(step / 300, 1)
-        group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+        current_momentum = (1 - frac) * 0.85 + frac * 0.95
+        group["momentum"] = current_momentum
 
-    # Step optimizers
+    # Step optimizers and get gradient norm
+    if step >= 1327:
+        grad_norm_adam = clip_grad_all_groups(optimizers[0], args.grad_clip)  #torch.nn.utils.clip_grad_norm_(optimizers[0].param_groups[0]['params'], args.grad_clip)  #clip_grad_all_groups(optimizers[0], args.grad_clip)
+        grad_norm_muon = clip_grad_all_groups(optimizers[1], args.grad_clip)  #torch.nn.utils.clip_grad_norm_(optimizers[1].param_groups[0]['params'], args.grad_clip)  #clip_grad_all_groups(optimizers[1], args.grad_clip)
+    else:
+        grad_norm_adam = None
+        grad_norm_muon = None
     for opt in optimizers:
-        grad_norm = torch.nn.utils.clip_grad_norm_(opt.param_groups[0]['params'], args.grad_clip)  # TODO: log grad_norm
         opt.step()
+
+    # Calculate current sequence length for training
+    current_mult = min(
+        args.seq_final_mult,
+        args.seq_init_mult + (args.seq_final_mult - args.seq_init_mult) *
+        ((step) / (((args.seq_ramp_frac * args.num_iterations) / max(1.0, (
+                args.seq_final_mult - args.seq_init_mult))) * args.gradient_accumulation_steps))
+    )
+    current_mult = max(1.0, current_mult)
+    current_train_seq_len = int(round(args.base_seq_len * current_mult))
 
     # Logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"########## TRAINING STEP {step + 1} of {train_steps} COMPLETE ##########")
-    timed_steps = step + 1 - 5 if step >= 5 else step + 1
-    print0(f"step:{step + 1}/{train_steps} pred_loss:{avg_pred_loss_for_logging:.4f} total_loss:{avg_total_loss_for_logging:.4f} chunk_size:{current_chunk_size} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / timed_steps:.2f}ms", console=True)
+    timed_steps = step + 1 - 10 if 10 <= step < 13 else step + 1
+    print0(
+        f"step:{step + 1}/{train_steps} pred_loss:{avg_pred_loss_for_logging:.4f} total_loss:{avg_total_loss_for_logging:.4f} chunk_size:{current_chunk_size} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / timed_steps:.2f}ms",
+        console=True)
+
+    # Log training metrics to wandb
+    if master_process:
+        log_dict = {
+            "train/pred_loss": avg_pred_loss_for_logging,
+            "train/total_loss": avg_total_loss_for_logging,
+            "train/gate_loss": avg_total_loss_for_logging - avg_pred_loss_for_logging,
+            "train/learning_rate_multiplier": current_lr_multiplier,
+            "train/learning_rate_adam_lm_head": args.lr_adam_lm_head * current_lr_multiplier,
+            "train/learning_rate_muon": args.lr_muon * current_lr_multiplier,
+            "train/sequence_length": current_train_seq_len,
+            "curriculum/chunk_size": current_chunk_size,
+            "curriculum/sequence_multiplier_train": current_mult,
+            "system/memory_allocated_mb": torch.cuda.memory_allocated() // 1024 // 1024,
+            "system/memory_reserved_mb": torch.cuda.memory_reserved() // 1024 // 1024,
+        }
+
+        # Add gradient norm if available
+        if grad_norm_adam is not None:
+            log_dict["grad_norm/optim_adam"] = grad_norm_adam.item() if hasattr(grad_norm_adam, 'item') else grad_norm_adam
+            log_dict["optim/gradient_norm_adam"] = log_dict["grad_norm/optim_adam"]
+        if grad_norm_muon is not None:
+            log_dict["grad_norm/optim_muon"] = grad_norm_muon.item() if hasattr(grad_norm_muon, 'item') else grad_norm_muon
+            log_dict["optim/gradient_norm_muon"] = log_dict["grad_norm/optim_muon"]
+
+        # Add momentum if available
+        if current_momentum is not None:
+            log_dict["optim/muon_momentum"] = current_momentum
+
+        # Add gradient norms if collected
+        log_dict.update(grad_norms)
+
+        if args.log_wandb:
+            wandb.log(log_dict, step=step + 1)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)

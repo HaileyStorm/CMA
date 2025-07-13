@@ -75,7 +75,11 @@ class CMAConfig:
     canon_kernel_size: int = 4
 
     DEBUG_LEVEL: int = 0
+    log_wandb: bool = False
     logfile: str = None
+
+    # Internal use
+    training_step: int = 0
 
     def __post_init__(self):
         if self.boundary_types is None:

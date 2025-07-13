@@ -2,6 +2,7 @@ from typing import Tuple, Optional, List, Dict
 import re
 import tiktoken
 import torch.nn as nn
+import wandb
 from triton.language import bfloat16
 
 from cma_components import *
@@ -249,11 +250,14 @@ class CascadeMemoryAttention(nn.Module):
         g = torch.sigmoid(gate_logits).permute(0, 2, 1).unsqueeze(-1)
 
         # Debug logging
-        if mem_len > 0 and self.config.DEBUG_LEVEL > 0 and (torch.rand(1).item() < 0.05 or not self.training):
+        if mem_len > 0:
             v_chunk_std = v_chunk.std(dim=(-1, -2)).mean().item() if v_chunk.numel() > 0 else 0.0
             v_mem_std = v_mem.std(dim=(-1, -2)).mean().item() if v_mem.numel() > 0 else 0.0
             g_mean = g.mean().item()
-            print0(f"DEBUG CMA Layer {self.layer_idx} _apply_gate details (training={self.training}): Step {getattr(self.config, 'training_step', 'N/A')}, g_mean={g_mean:.4f}, v_chunk_std={v_chunk_std:.4f}, v_mem_std={v_mem_std:.4f}", self.config.logfile)
+            if self.config.DEBUG_LEVEL > 0 and (torch.rand(1).item() < 0.05 or not self.training):
+                print0(f"DEBUG CMA Layer {self.layer_idx} _apply_gate details (training={self.training}): Step {getattr(self.config, 'training_step', 'N/A')}, g_mean={g_mean:.4f}, v_chunk_std={v_chunk_std:.4f}, v_mem_std={v_mem_std:.4f}", self.config.logfile)
+            if self.config.log_wandb:
+                wandb.log({f"gate_stats/layer_{self.layer_idx}_g_mean":g_mean, f"gate_stats/layer_{self.layer_idx}_v_chunk_std":v_chunk_std, f"gate_stats/layer_{self.layer_idx}_v_mem_std":v_mem_std}, step=self.config.training_step)
 
         Y = Y_chunk + g * Y_mem
 
@@ -436,6 +440,8 @@ class CMAModel(nn.Module):
     def __init__(self, config: CMAConfig, vocab_size: int, tokenizer=None):
         super().__init__()
         self.config = config
+        if config.log_wandb:
+            import wandb
         self.vocab_size = vocab_size
         self.tokenizer = tokenizer or tiktoken.get_encoding("gpt2")
 
@@ -957,6 +963,8 @@ class CMAModel(nn.Module):
                 std_val = mem_tensor.std().item()
                 abs_max_val = mem_tensor.abs().max().item()
                 print0(f"{log_prefix} - Group {group_id}: Shape={mem_tensor.shape}, Mean={mean_val:.4f}, Std={std_val:.4f}, AbsMax={abs_max_val:.4f}", self.config.logfile)
+                if self.config.log_wandb:
+                    wandb.log({f"mem_stats/{pass_name}_{group_id}_chunk{chunk_idx}_mean":mean_val, f"mem_stats/{pass_name}_{group_id}_chunk{chunk_idx}_std":std_val, f"mem_stats/{pass_name}_{group_id}_chunk{chunk_idx}_abs_max":abs_max_val}, step=self.training_step)
             elif mem_tensor is not None:
                 print0(f"{log_prefix} - Group {group_id}: Shape={mem_tensor.shape} (Empty Tensor)", self.config.logfile)
             else:
@@ -1013,6 +1021,8 @@ class CMAModel(nn.Module):
             p_drop_for_debug = 0.0
             if self.training and self.config.enable_mask_future_dropout:
                 p_drop = get_mask_future_schedule(self.config, self.training_step, self.total_training_steps)
+                if self.config.log_wandb:
+                    wandb.log({"curriculum/p_future_drop": p_drop}, step=self.training_step)
                 p_drop_for_debug = p_drop
                 if self.config.DEBUG_LEVEL > 0:
                     print0(f"DEBUG MASKING: Training step {self.training_step}, M_rev_persist p_drop: {p_drop:.4f}",
@@ -1396,6 +1406,7 @@ class CMAModel(nn.Module):
     def set_training_step(self, step: int, total_steps: int):
         """Set current training step for mask-future scheduling"""
         self.training_step = step
+        self.config.training_step = step
         self.total_training_steps = total_steps
         if self.config.DEBUG_LEVEL > 0:
             print0(f"DEBUG: Training step set to {step}, total steps {total_steps}", self.config.logfile)
